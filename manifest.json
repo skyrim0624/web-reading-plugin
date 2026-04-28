@@ -1,0 +1,10 @@
+{
+  "id": "web-reading-plugin",
+  "name": "Web",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "用 Codex CLI harness 跟随阅读上下文，把问题、回答和跨书关联织成 Obsidian 阅读知识网。",
+  "author": "Andreas",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

@@ -1,0 +1,31 @@
+{
+  "name": "web-reading-plugin",
+  "version": "0.1.0",
+  "description": "Obsidian 插件：用 Codex CLI harness 跟随阅读上下文，把问题、回答和跨书关联织成阅读知识网。",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit --skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "codex",
+    "reading",
+    "agent"
+  ],
+  "author": "Andreas",
+  "license": "MIT",
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "builtin-modules": "^5.1.0",
+    "esbuild": "^0.28.0",
+    "obsidian": "^1.12.3",
+    "typescript": "^6.0.3"
+  }
+}
