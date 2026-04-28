@@ -2,6 +2,10 @@
 
 Obsidian 插件原型：通过本机 Codex CLI harness 跟随当前阅读上下文，把阅读中的问题、回答、旧笔记和跨书关联织成一张知识网。
 
+## 分享给朋友安装
+
+把 [AGENT_INSTALL.md](./AGENT_INSTALL.md) 发给朋友的 agent。那份文档包含从克隆仓库、构建、安装到 Obsidian vault、写入配置、启用插件到使用和排错的完整步骤。
+
 ## 当前能力
 
 - 读取当前 Markdown 笔记、选区、光标附近段落、标题路径和文档大纲。
