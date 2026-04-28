@@ -20,6 +20,7 @@ import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import { dirname } from "path";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Root, createRoot } from "react-dom/client";
 
 const VIEW_TYPE_CODEX_READING = "web-reading-plugin-view";
@@ -47,6 +48,32 @@ interface ReadingSelection {
   text: string;
   startLine: number;
   endLine: number;
+}
+
+interface SelectionAnchorRect {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface SelectionSnapshot {
+  filePath: string;
+  text: string;
+  from?: EditorPosition;
+  to?: EditorPosition;
+  rect?: SelectionAnchorRect;
+  capturedAt: number;
+}
+
+interface MarkedSelectionResult {
+  filePath: string;
+  text: string;
+  startLine: number;
+  endLine: number;
+  rect?: SelectionAnchorRect;
 }
 
 interface HeadingItem {
@@ -155,6 +182,14 @@ interface ChatMessage {
   isStreaming?: boolean;
 }
 
+interface ConnectorState {
+  id: string;
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+}
+
 interface CodexQuestionBlock {
   startLine: number;
   endLine: number;
@@ -186,6 +221,7 @@ const DEFAULT_SETTINGS: CodexReadingSettings = {
 export default class CodexReadingPlugin extends Plugin {
   settings: CodexReadingSettings = DEFAULT_SETTINGS;
   private lastMarkedText = "";
+  private lastSelectionSnapshot: SelectionSnapshot | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -237,10 +273,7 @@ export default class CodexReadingPlugin extends Plugin {
     });
 
     this.registerDomEvent(document, "selectionchange", () => {
-      const selectedText = getCurrentDomSelectionText();
-      if (selectedText) {
-        this.lastMarkedText = trimToLimit(selectedText, this.settings.maxContextChars);
-      }
+      this.captureSelectionSnapshot();
     });
 
     this.addSettingTab(new CodexReadingSettingTab(this.app, this));
@@ -309,12 +342,19 @@ export default class CodexReadingPlugin extends Plugin {
 
     const content = await this.app.vault.read(file);
     const cursor = editor.getCursor();
-    const selectedText = editor.getSelection() || getCurrentDomSelectionText() || this.lastMarkedText;
+    const selectionSnapshot = this.getUsableSelectionSnapshot(file.path);
+    const editorSelection = editor.getSelection();
+    const selectedText =
+      editorSelection || getCurrentDomSelectionText() || selectionSnapshot?.text;
     const selection = selectedText
       ? {
           text: trimToLimit(selectedText, this.settings.maxContextChars),
-          startLine: editor.getCursor("from").line + 1,
-          endLine: editor.getCursor("to").line + 1,
+          startLine: editorSelection
+            ? editor.getCursor("from").line + 1
+            : (selectionSnapshot?.from?.line ?? editor.getCursor("from").line) + 1,
+          endLine: editorSelection
+            ? editor.getCursor("to").line + 1
+            : (selectionSnapshot?.to?.line ?? editor.getCursor("to").line) + 1,
         }
       : undefined;
     const lines = content.split(/\r?\n/);
@@ -340,6 +380,48 @@ export default class CodexReadingPlugin extends Plugin {
       agentMemoryExcerpt: undefined,
       capturedAt: new Date().toISOString(),
     };
+  }
+
+  async markActiveSelection(context: ReadingContext): Promise<MarkedSelectionResult | null> {
+    if (!context.selection?.text.trim()) return null;
+
+    const markdownView = this.getReadingMarkdownView();
+    const file = markdownView?.file;
+    const editor = markdownView?.editor;
+    if (!file || !editor || file.path !== context.activeFilePath) return null;
+
+    const snapshot = this.getUsableSelectionSnapshot(file.path);
+    const editorSelection = editor.getSelection();
+
+    if (editorSelection.trim()) {
+      const from = editor.getCursor("from");
+      const to = editor.getCursor("to");
+      const result = wrapEditorRangeWithHighlight(editor, file.path, from, to, snapshot?.rect);
+      if (result) return result;
+    }
+
+    if (snapshot?.from && snapshot.to) {
+      const selectedRange = editor.getRange(snapshot.from, snapshot.to);
+      if (isSameLooseText(selectedRange, context.selection.text)) {
+        const result = wrapEditorRangeWithHighlight(
+          editor,
+          file.path,
+          snapshot.from,
+          snapshot.to,
+          snapshot.rect,
+        );
+        if (result) return result;
+      }
+    }
+
+    return this.markSelectionByTextSearch(file, context, snapshot?.rect);
+  }
+
+  getSelectionAnchorRect(filePath?: string): SelectionAnchorRect | null {
+    const snapshot = filePath
+      ? this.getUsableSelectionSnapshot(filePath)
+      : this.lastSelectionSnapshot;
+    return snapshot?.rect ?? null;
   }
 
   async enrichReadingContext(context: ReadingContext, query = ""): Promise<ExtendedReadingContext> {
@@ -973,6 +1055,71 @@ export default class CodexReadingPlugin extends Plugin {
       .filter((path) => path.endsWith(".md"))
       .slice(0, 10);
   }
+
+  private captureSelectionSnapshot() {
+    const selectedText = getCurrentDomSelectionText();
+    if (!selectedText) return;
+
+    const markdownView = this.getReadingMarkdownView();
+    const file = markdownView?.file;
+    if (!file) return;
+
+    const editor = markdownView.editor;
+    const editorSelection = editor.getSelection();
+    const hasEditorSelection = Boolean(editorSelection.trim());
+    const rect = getCurrentSelectionAnchorRect() ?? this.lastSelectionSnapshot?.rect;
+
+    this.lastMarkedText = trimToLimit(selectedText, this.settings.maxContextChars);
+    this.lastSelectionSnapshot = {
+      filePath: file.path,
+      text: this.lastMarkedText,
+      from: hasEditorSelection ? cloneEditorPosition(editor.getCursor("from")) : undefined,
+      to: hasEditorSelection ? cloneEditorPosition(editor.getCursor("to")) : undefined,
+      rect: rect ?? undefined,
+      capturedAt: Date.now(),
+    };
+  }
+
+  private getUsableSelectionSnapshot(filePath: string): SelectionSnapshot | null {
+    if (!this.lastSelectionSnapshot) return null;
+    if (this.lastSelectionSnapshot.filePath !== filePath) return null;
+    if (Date.now() - this.lastSelectionSnapshot.capturedAt > 10 * 60 * 1000) return null;
+    return this.lastSelectionSnapshot;
+  }
+
+  private async markSelectionByTextSearch(
+    file: TFile,
+    context: ReadingContext,
+    rect?: SelectionAnchorRect,
+  ): Promise<MarkedSelectionResult | null> {
+    const selectedText = context.selection?.text.trim();
+    if (!selectedText) return null;
+
+    const content = await this.app.vault.read(file);
+    const range = findSelectionRangeInContent(content, selectedText, context.cursorLine);
+    if (!range) return null;
+    if (isContentRangeAlreadyHighlighted(content, range.start, range.end)) {
+      return {
+        filePath: file.path,
+        text: content.slice(range.start, range.end),
+        startLine: getLineNumberAtOffset(content, range.start),
+        endLine: getLineNumberAtOffset(content, range.end),
+        rect,
+      };
+    }
+
+    const original = content.slice(range.start, range.end);
+    const updated = `${content.slice(0, range.start)}==${original}==${content.slice(range.end)}`;
+    await this.app.vault.modify(file, updated);
+
+    return {
+      filePath: file.path,
+      text: original,
+      startLine: getLineNumberAtOffset(content, range.start),
+      endLine: getLineNumberAtOffset(content, range.end),
+      rect,
+    };
+  }
 }
 
 class CodexReadingView extends ItemView {
@@ -1014,7 +1161,10 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [context, setContext] = useState<ReadingContext | null>(null);
+  const [connector, setConnector] = useState<ConnectorState | null>(null);
   const [running, setRunning] = useState(false);
+  const composerRef = useRef<HTMLDivElement | null>(null);
+  const connectorTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const contextSummary = useMemo(() => {
@@ -1050,6 +1200,46 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages, running]);
 
+  const clearConnectorTimer = useCallback(() => {
+    if (connectorTimerRef.current !== null) {
+      window.clearTimeout(connectorTimerRef.current);
+      connectorTimerRef.current = null;
+    }
+  }, []);
+
+  const showSelectionConnector = useCallback(
+    (anchorRect: SelectionAnchorRect | null) => {
+      const composerRect = composerRef.current?.getBoundingClientRect();
+      if (!anchorRect || !composerRect) return;
+      clearConnectorTimer();
+      setConnector({
+        id: createMessageId(),
+        startX: composerRect.left - 6,
+        startY: composerRect.top + composerRect.height / 2,
+        endX: anchorRect.right + 4,
+        endY: anchorRect.top + anchorRect.height / 2,
+      });
+    },
+    [clearConnectorTimer],
+  );
+
+  const hideSelectionConnectorSoon = useCallback(
+    (delay = 1600) => {
+      clearConnectorTimer();
+      connectorTimerRef.current = window.setTimeout(() => {
+        setConnector(null);
+        connectorTimerRef.current = null;
+      }, delay);
+    },
+    [clearConnectorTimer],
+  );
+
+  useEffect(() => {
+    return () => {
+      clearConnectorTimer();
+    };
+  }, [clearConnectorTimer]);
+
   const askCodex = useCallback(async () => {
     const question = draft.trim();
     if (!question) {
@@ -1072,10 +1262,15 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       isStreaming: true,
     };
     setMessages((current) => [...current, userMessage, assistantMessage]);
+    showSelectionConnector(plugin.getSelectionAnchorRect());
 
     try {
       const nextContext = await plugin.buildReadingContext();
       setContext(nextContext);
+      const markedSelection = await plugin.markActiveSelection(nextContext);
+      showSelectionConnector(
+        markedSelection?.rect ?? plugin.getSelectionAnchorRect(nextContext.activeFilePath),
+      );
       setMessages((current) =>
         current.map((message) =>
           message.id === userMessage.id ? { ...message, context: nextContext } : message,
@@ -1139,8 +1334,9 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       new Notice(message);
     } finally {
       setRunning(false);
+      hideSelectionConnectorSoon();
     }
-  }, [draft, messages, plugin]);
+  }, [draft, hideSelectionConnectorSoon, messages, plugin, showSelectionConnector]);
 
   const onComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1155,6 +1351,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
 
   return (
     <div className="codex-reading-view">
+      <SelectionConnectorOverlay connector={connector} />
       <div className="codex-reading-header">
         <div className="codex-reading-title">Web</div>
         {contextSummary ? (
@@ -1211,7 +1408,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="codex-chat-composer">
+      <div className="codex-chat-composer" ref={composerRef}>
         <textarea
           className="codex-chat-input"
           disabled={running}
@@ -1285,6 +1482,46 @@ function AnswerSection({ title, content }: { title: string; content?: string }) 
       <div className="codex-answer-section-title">{title}</div>
       <div>{content}</div>
     </div>
+  );
+}
+
+function SelectionConnectorOverlay({ connector }: { connector: ConnectorState | null }) {
+  if (!connector) return null;
+
+  const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+  const direction = connector.startX > connector.endX ? -1 : 1;
+  const distance = Math.abs(connector.startX - connector.endX);
+  const controlOffset = Math.max(72, Math.min(distance * 0.42, 260));
+  const path = [
+    `M ${connector.startX} ${connector.startY}`,
+    `C ${connector.startX + direction * controlOffset} ${connector.startY}`,
+    `${connector.endX - direction * controlOffset * 0.45} ${connector.endY}`,
+    `${connector.endX} ${connector.endY}`,
+  ].join(" ");
+
+  return createPortal(
+    <div aria-hidden="true" className="codex-selection-connector" key={connector.id}>
+      <svg
+        className="codex-selection-connector-svg"
+        height={viewportHeight}
+        width={viewportWidth}
+      >
+        <path className="codex-selection-connector-path-shadow" d={path} />
+        <path className="codex-selection-connector-path" d={path} />
+      </svg>
+      <div
+        className="codex-selection-plunger"
+        style={{
+          left: connector.endX,
+          top: connector.endY,
+        }}
+      >
+        <span className="codex-selection-plunger-head" />
+        <span className="codex-selection-plunger-stick" />
+      </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -2425,6 +2662,179 @@ function getCurrentDomSelectionText(): string {
   }
   const selectedText = selection?.toString().trim() ?? "";
   return selectedText.length > 1 ? selectedText : "";
+}
+
+function getCurrentSelectionAnchorRect(): SelectionAnchorRect | null {
+  const selection = globalThis.getSelection?.();
+  if (!selection || selection.rangeCount === 0 || selection.toString().trim().length <= 1) return null;
+  const anchorElement =
+    selection.anchorNode instanceof Element
+      ? selection.anchorNode
+      : selection.anchorNode?.parentElement;
+  if (anchorElement?.closest(".codex-reading-root")) return null;
+
+  const range = selection.getRangeAt(0);
+  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+  const rect = rects[rects.length - 1] ?? range.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+
+  return {
+    left: rect.left,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function cloneEditorPosition(position: EditorPosition): EditorPosition {
+  return {
+    line: position.line,
+    ch: position.ch,
+  };
+}
+
+function wrapEditorRangeWithHighlight(
+  editor: Editor,
+  filePath: string,
+  from: EditorPosition,
+  to: EditorPosition,
+  rect?: SelectionAnchorRect,
+): MarkedSelectionResult | null {
+  const selectedText = editor.getRange(from, to);
+  if (!selectedText.trim()) return null;
+  if (isEditorRangeAlreadyHighlighted(editor, from, to)) {
+    return {
+      filePath,
+      text: selectedText,
+      startLine: from.line + 1,
+      endLine: to.line + 1,
+      rect,
+    };
+  }
+
+  editor.replaceRange(`==${selectedText}==`, from, to);
+  return {
+    filePath,
+    text: selectedText,
+    startLine: from.line + 1,
+    endLine: to.line + 1,
+    rect,
+  };
+}
+
+function isEditorRangeAlreadyHighlighted(
+  editor: Editor,
+  from: EditorPosition,
+  to: EditorPosition,
+): boolean {
+  const beforeStart = {
+    line: from.line,
+    ch: Math.max(0, from.ch - 2),
+  };
+  const before = editor.getRange(beforeStart, from);
+  const toLineLength = editor.getLine(to.line)?.length ?? to.ch;
+  const after = editor.getRange(to, {
+    line: to.line,
+    ch: Math.min(toLineLength, to.ch + 2),
+  });
+  return before.endsWith("==") && after.startsWith("==");
+}
+
+function isContentRangeAlreadyHighlighted(content: string, start: number, end: number): boolean {
+  return content.slice(Math.max(0, start - 2), start) === "==" && content.slice(end, end + 2) === "==";
+}
+
+function findSelectionRangeInContent(
+  content: string,
+  selectedText: string,
+  cursorLine: number,
+): { start: number; end: number } | null {
+  const exactMatches = findAllExactRanges(content, selectedText);
+  if (exactMatches.length > 0) {
+    return chooseClosestRangeToLine(content, exactMatches, cursorLine);
+  }
+
+  const normalizedRange = findNormalizedSelectionRange(content, selectedText);
+  if (!normalizedRange) return null;
+  return normalizedRange;
+}
+
+function findAllExactRanges(content: string, selectedText: string): Array<{ start: number; end: number }> {
+  const needle = selectedText.trim();
+  if (!needle) return [];
+
+  const matches: Array<{ start: number; end: number }> = [];
+  let fromIndex = 0;
+  while (fromIndex < content.length) {
+    const matchIndex = content.indexOf(needle, fromIndex);
+    if (matchIndex < 0) break;
+    matches.push({ start: matchIndex, end: matchIndex + needle.length });
+    fromIndex = matchIndex + needle.length;
+  }
+  return matches;
+}
+
+function chooseClosestRangeToLine(
+  content: string,
+  ranges: Array<{ start: number; end: number }>,
+  cursorLine: number,
+): { start: number; end: number } {
+  return ranges
+    .slice()
+    .sort((left, right) => {
+      const leftDistance = Math.abs(getLineNumberAtOffset(content, left.start) - cursorLine);
+      const rightDistance = Math.abs(getLineNumberAtOffset(content, right.start) - cursorLine);
+      return leftDistance - rightDistance;
+    })[0];
+}
+
+function findNormalizedSelectionRange(
+  content: string,
+  selectedText: string,
+): { start: number; end: number } | null {
+  const normalizedNeedle = selectedText.replace(/\s+/g, " ").trim();
+  if (!normalizedNeedle) return null;
+
+  const normalizedChars: string[] = [];
+  const sourceOffsets: number[] = [];
+  let previousWasSpace = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    if (/\s/.test(char)) {
+      if (!previousWasSpace) {
+        normalizedChars.push(" ");
+        sourceOffsets.push(index);
+        previousWasSpace = true;
+      }
+      continue;
+    }
+
+    normalizedChars.push(char);
+    sourceOffsets.push(index);
+    previousWasSpace = false;
+  }
+
+  const normalizedContent = normalizedChars.join("").trim();
+  const leadingTrimmedLength = normalizedChars.join("").length - normalizedChars.join("").trimStart().length;
+  const normalizedIndex = normalizedContent.indexOf(normalizedNeedle);
+  if (normalizedIndex < 0) return null;
+
+  const startNormalizedIndex = normalizedIndex + leadingTrimmedLength;
+  const endNormalizedIndex = startNormalizedIndex + normalizedNeedle.length - 1;
+  const start = sourceOffsets[startNormalizedIndex];
+  const end = (sourceOffsets[endNormalizedIndex] ?? start) + 1;
+  return start === undefined ? null : { start, end };
+}
+
+function getLineNumberAtOffset(content: string, offset: number): number {
+  return content.slice(0, Math.max(0, offset)).split(/\r?\n/).length;
+}
+
+function isSameLooseText(left: string, right: string): boolean {
+  return left.replace(/\s+/g, " ").trim() === right.replace(/\s+/g, " ").trim();
 }
 
 function looksLikePath(command: string): boolean {
