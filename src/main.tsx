@@ -1171,7 +1171,8 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       <div className="codex-chat-list">
         {messages.length === 0 ? (
           <div className="codex-chat-empty">
-            在正文中划选一句话或把光标停在段落里，然后直接在下面提问。
+            <div className="codex-chat-empty-mark">Web</div>
+            <div className="codex-chat-empty-title">等待你的阅读问题</div>
           </div>
         ) : null}
         {messages.map((message) => (
@@ -1216,11 +1217,19 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           disabled={running}
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={onComposerKeyDown}
-          placeholder="直接问 Web。Enter 发送，Shift+Enter 换行。"
+          placeholder="问这段文字、概念或线索..."
           value={draft}
         />
-        <button className="mod-cta codex-chat-send" disabled={running || !draft.trim()} onClick={askCodex}>
-          {running ? "阅读中" : "发送"}
+        <button
+          aria-label={running ? "Web 正在阅读" : "发送给 Web"}
+          className="mod-cta codex-chat-send"
+          disabled={running || !draft.trim()}
+          onClick={askCodex}
+          title={running ? "Web 正在阅读" : "发送"}
+        >
+          <span aria-hidden="true" className="codex-chat-send-icon">
+            {running ? "..." : "↑"}
+          </span>
         </button>
       </div>
     </div>
