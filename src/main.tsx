@@ -6,6 +6,7 @@ import {
   FileSystemAdapter,
   ItemView,
   MarkdownFileInfo,
+  MarkdownRenderer,
   MarkdownView,
   Notice,
   Plugin,
@@ -20,7 +21,6 @@ import { spawn } from "child_process";
 import { promises as fs } from "fs";
 import { dirname } from "path";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { Root, createRoot } from "react-dom/client";
 
 const VIEW_TYPE_CODEX_READING = "web-reading-plugin-view";
@@ -50,21 +50,11 @@ interface ReadingSelection {
   endLine: number;
 }
 
-interface SelectionAnchorRect {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-  width: number;
-  height: number;
-}
-
 interface SelectionSnapshot {
   filePath: string;
   text: string;
   from?: EditorPosition;
   to?: EditorPosition;
-  rect?: SelectionAnchorRect;
   capturedAt: number;
 }
 
@@ -73,7 +63,7 @@ interface MarkedSelectionResult {
   text: string;
   startLine: number;
   endLine: number;
-  rect?: SelectionAnchorRect;
+  anchorId: string;
 }
 
 interface HeadingItem {
@@ -182,14 +172,6 @@ interface ChatMessage {
   isStreaming?: boolean;
 }
 
-interface ConnectorState {
-  id: string;
-  startX: number;
-  startY: number;
-  endX: number;
-  endY: number;
-}
-
 interface CodexQuestionBlock {
   startLine: number;
   endLine: number;
@@ -222,6 +204,7 @@ export default class CodexReadingPlugin extends Plugin {
   settings: CodexReadingSettings = DEFAULT_SETTINGS;
   private lastMarkedText = "";
   private lastSelectionSnapshot: SelectionSnapshot | null = null;
+  private highlightPopover: HTMLElement | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -275,6 +258,9 @@ export default class CodexReadingPlugin extends Plugin {
     this.registerDomEvent(document, "selectionchange", () => {
       this.captureSelectionSnapshot();
     });
+    this.registerDomEvent(document, "click", (event) => {
+      void this.handleHighlightNoteClick(event);
+    });
 
     this.addSettingTab(new CodexReadingSettingTab(this.app, this));
   }
@@ -283,6 +269,7 @@ export default class CodexReadingPlugin extends Plugin {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CODEX_READING)) {
       leaf.detach();
     }
+    this.closeHighlightPopover();
   }
 
   async activateView() {
@@ -396,32 +383,19 @@ export default class CodexReadingPlugin extends Plugin {
     if (editorSelection.trim()) {
       const from = editor.getCursor("from");
       const to = editor.getCursor("to");
-      const result = wrapEditorRangeWithHighlight(editor, file.path, from, to, snapshot?.rect);
+      const result = wrapEditorRangeWithHighlight(editor, file.path, from, to);
       if (result) return result;
     }
 
     if (snapshot?.from && snapshot.to) {
       const selectedRange = editor.getRange(snapshot.from, snapshot.to);
       if (isSameLooseText(selectedRange, context.selection.text)) {
-        const result = wrapEditorRangeWithHighlight(
-          editor,
-          file.path,
-          snapshot.from,
-          snapshot.to,
-          snapshot.rect,
-        );
+        const result = wrapEditorRangeWithHighlight(editor, file.path, snapshot.from, snapshot.to);
         if (result) return result;
       }
     }
 
-    return this.markSelectionByTextSearch(file, context, snapshot?.rect);
-  }
-
-  getSelectionAnchorRect(filePath?: string): SelectionAnchorRect | null {
-    const snapshot = filePath
-      ? this.getUsableSelectionSnapshot(filePath)
-      : this.lastSelectionSnapshot;
-    return snapshot?.rect ?? null;
+    return this.markSelectionByTextSearch(file, context);
   }
 
   async enrichReadingContext(context: ReadingContext, query = ""): Promise<ExtendedReadingContext> {
@@ -1067,7 +1041,6 @@ export default class CodexReadingPlugin extends Plugin {
     const editor = markdownView.editor;
     const editorSelection = editor.getSelection();
     const hasEditorSelection = Boolean(editorSelection.trim());
-    const rect = getCurrentSelectionAnchorRect() ?? this.lastSelectionSnapshot?.rect;
 
     this.lastMarkedText = trimToLimit(selectedText, this.settings.maxContextChars);
     this.lastSelectionSnapshot = {
@@ -1075,7 +1048,6 @@ export default class CodexReadingPlugin extends Plugin {
       text: this.lastMarkedText,
       from: hasEditorSelection ? cloneEditorPosition(editor.getCursor("from")) : undefined,
       to: hasEditorSelection ? cloneEditorPosition(editor.getCursor("to")) : undefined,
-      rect: rect ?? undefined,
       capturedAt: Date.now(),
     };
   }
@@ -1090,7 +1062,6 @@ export default class CodexReadingPlugin extends Plugin {
   private async markSelectionByTextSearch(
     file: TFile,
     context: ReadingContext,
-    rect?: SelectionAnchorRect,
   ): Promise<MarkedSelectionResult | null> {
     const selectedText = context.selection?.text.trim();
     if (!selectedText) return null;
@@ -1099,17 +1070,25 @@ export default class CodexReadingPlugin extends Plugin {
     const range = findSelectionRangeInContent(content, selectedText, context.cursorLine);
     if (!range) return null;
     if (isContentRangeAlreadyHighlighted(content, range.start, range.end)) {
+      const existingAnchorId = getHighlightAnchorAfterContentRange(content, range.end + 2);
+      const anchorId = existingAnchorId ?? createHighlightAnchorId();
+      if (!existingAnchorId) {
+        const insertAt = Math.min(content.length, range.end + 2);
+        const updated = `${content.slice(0, insertAt)}${formatHighlightAnchorMarkup(anchorId)}${content.slice(insertAt)}`;
+        await this.app.vault.modify(file, updated);
+      }
       return {
         filePath: file.path,
         text: content.slice(range.start, range.end),
         startLine: getLineNumberAtOffset(content, range.start),
         endLine: getLineNumberAtOffset(content, range.end),
-        rect,
+        anchorId,
       };
     }
 
+    const anchorId = createHighlightAnchorId();
     const original = content.slice(range.start, range.end);
-    const updated = `${content.slice(0, range.start)}==${original}==${content.slice(range.end)}`;
+    const updated = `${content.slice(0, range.start)}==${original}==${formatHighlightAnchorMarkup(anchorId)}${content.slice(range.end)}`;
     await this.app.vault.modify(file, updated);
 
     return {
@@ -1117,8 +1096,132 @@ export default class CodexReadingPlugin extends Plugin {
       text: original,
       startLine: getLineNumberAtOffset(content, range.start),
       endLine: getLineNumberAtOffset(content, range.end),
-      rect,
+      anchorId,
     };
+  }
+
+  async appendHighlightDiscussion(
+    anchor: MarkedSelectionResult,
+    context: ExtendedReadingContext,
+    question: string,
+    result: CodexRunResult,
+    record: PersistedQuestionRecord,
+    readingNotePath: string,
+  ): Promise<string> {
+    const noteFolder = normalizePath(this.settings.noteFolder || DEFAULT_SETTINGS.noteFolder);
+    const highlightFolder = normalizePath(`${noteFolder}/高亮批注`);
+    await this.ensureFolder(highlightFolder);
+
+    const targetPath = normalizePath(`${highlightFolder}/${anchor.anchorId}.md`);
+    const sourceLink = formatWikiLink(context.activeFilePath, context.activeFileName);
+    const questionNodeLink = formatWikiLink(record.questionNodePath, "问题节点");
+    const readingNoteLink = formatWikiLink(readingNotePath, "阅读笔记");
+    const trailLinks = record.readingTrailPaths.length
+      ? record.readingTrailPaths.map((path) => formatWikiLink(path)).join("、")
+      : "无";
+    const entry = [
+      "",
+      `## ${formatLocalDateTime(new Date())}`,
+      "",
+      `- 来源：${sourceLink}，第 ${anchor.startLine}-${anchor.endLine} 行`,
+      `- 问题节点：${questionNodeLink}`,
+      `- 阅读笔记：${readingNoteLink}`,
+      `- 阅读线索：${trailLinks}`,
+      "",
+      "**高亮原文**",
+      "",
+      blockquoteMarkdown(anchor.text),
+      "",
+      "**问题**",
+      "",
+      question.trim(),
+      "",
+      "**Web 回答**",
+      "",
+      formatAnswerForReadingNote(result),
+      "",
+    ].join("\n");
+
+    const existing = this.app.vault.getAbstractFileByPath(targetPath);
+    if (existing instanceof TFile) {
+      const current = await this.app.vault.read(existing);
+      await this.app.vault.modify(existing, `${current.trimEnd()}\n${entry}`);
+    } else {
+      const header = [
+        `# 高亮批注 ${anchor.anchorId}`,
+        "",
+        `来源：${sourceLink}`,
+        `位置：第 ${anchor.startLine}-${anchor.endLine} 行`,
+        "",
+        "这个文件由 Web 自动维护，用来保存同一处高亮上的连续问题和讨论。",
+        "",
+      ].join("\n");
+      await this.app.vault.create(targetPath, `${header}${entry}`);
+    }
+
+    return targetPath;
+  }
+
+  private async handleHighlightNoteClick(event: MouseEvent) {
+    const target = event.target instanceof Element ? event.target : null;
+    const marker = target?.closest<HTMLElement>(".web-highlight-note[data-web-anchor]");
+    if (!marker) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const anchorId = marker.dataset.webAnchor;
+    if (!anchorId) return;
+    await this.showHighlightPopover(anchorId, marker);
+  }
+
+  private async showHighlightPopover(anchorId: string, marker: HTMLElement) {
+    this.closeHighlightPopover();
+
+    const noteFolder = normalizePath(this.settings.noteFolder || DEFAULT_SETTINGS.noteFolder);
+    const notePath = normalizePath(`${noteFolder}/高亮批注/${anchorId}.md`);
+    const popover = document.body.createDiv({ cls: "web-highlight-popover" });
+    const markerRect = marker.getBoundingClientRect();
+    const maxLeft = Math.max(16, window.innerWidth - 390);
+    popover.style.left = `${Math.min(markerRect.right + 10, maxLeft)}px`;
+    popover.style.top = `${Math.max(16, Math.min(markerRect.top - 12, window.innerHeight - 460))}px`;
+
+    const header = popover.createDiv({ cls: "web-highlight-popover-header" });
+    header.createDiv({ cls: "web-highlight-popover-title", text: "Web 高亮批注" });
+    const closeButton = header.createEl("button", {
+      cls: "web-highlight-popover-close",
+      text: "×",
+      attr: { "aria-label": "关闭高亮批注" },
+    });
+    closeButton.addEventListener("click", () => this.closeHighlightPopover());
+
+    const body = popover.createDiv({ cls: "web-highlight-popover-body" });
+    const file = this.app.vault.getAbstractFileByPath(notePath);
+    if (file instanceof TFile) {
+      const markdown = await this.app.vault.read(file);
+      await MarkdownRenderer.render(this.app, markdown, body, notePath, this);
+    } else {
+      body.createDiv({
+        cls: "web-highlight-popover-empty",
+        text: "这里还没有保存讨论。发送一次 Web 问题后，这个高亮处会记录问题和回答。",
+      });
+    }
+
+    const footer = popover.createDiv({ cls: "web-highlight-popover-footer" });
+    const openButton = footer.createEl("button", {
+      cls: "web-highlight-popover-open",
+      text: "打开批注笔记",
+    });
+    openButton.addEventListener("click", () => {
+      void this.app.workspace.openLinkText(notePath, "", false);
+      this.closeHighlightPopover();
+    });
+
+    this.highlightPopover = popover;
+  }
+
+  private closeHighlightPopover() {
+    this.highlightPopover?.remove();
+    this.highlightPopover = null;
   }
 }
 
@@ -1161,10 +1264,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [context, setContext] = useState<ReadingContext | null>(null);
-  const [connector, setConnector] = useState<ConnectorState | null>(null);
   const [running, setRunning] = useState(false);
-  const composerRef = useRef<HTMLDivElement | null>(null);
-  const connectorTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const contextSummary = useMemo(() => {
@@ -1200,46 +1300,6 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages, running]);
 
-  const clearConnectorTimer = useCallback(() => {
-    if (connectorTimerRef.current !== null) {
-      window.clearTimeout(connectorTimerRef.current);
-      connectorTimerRef.current = null;
-    }
-  }, []);
-
-  const showSelectionConnector = useCallback(
-    (anchorRect: SelectionAnchorRect | null) => {
-      const composerRect = composerRef.current?.getBoundingClientRect();
-      if (!anchorRect || !composerRect) return;
-      clearConnectorTimer();
-      setConnector({
-        id: createMessageId(),
-        startX: composerRect.left - 6,
-        startY: composerRect.top + composerRect.height / 2,
-        endX: anchorRect.right + 4,
-        endY: anchorRect.top + anchorRect.height / 2,
-      });
-    },
-    [clearConnectorTimer],
-  );
-
-  const hideSelectionConnectorSoon = useCallback(
-    (delay = 1600) => {
-      clearConnectorTimer();
-      connectorTimerRef.current = window.setTimeout(() => {
-        setConnector(null);
-        connectorTimerRef.current = null;
-      }, delay);
-    },
-    [clearConnectorTimer],
-  );
-
-  useEffect(() => {
-    return () => {
-      clearConnectorTimer();
-    };
-  }, [clearConnectorTimer]);
-
   const askCodex = useCallback(async () => {
     const question = draft.trim();
     if (!question) {
@@ -1262,15 +1322,12 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       isStreaming: true,
     };
     setMessages((current) => [...current, userMessage, assistantMessage]);
-    showSelectionConnector(plugin.getSelectionAnchorRect());
+    let markedSelection: MarkedSelectionResult | null = null;
 
     try {
       const nextContext = await plugin.buildReadingContext();
       setContext(nextContext);
-      const markedSelection = await plugin.markActiveSelection(nextContext);
-      showSelectionConnector(
-        markedSelection?.rect ?? plugin.getSelectionAnchorRect(nextContext.activeFilePath),
-      );
+      markedSelection = await plugin.markActiveSelection(nextContext);
       setMessages((current) =>
         current.map((message) =>
           message.id === userMessage.id ? { ...message, context: nextContext } : message,
@@ -1309,6 +1366,16 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           formatAnswerForReadingNote(result),
         );
         const persistedRecord = await plugin.persistQuestionRecord(nextContext, question, result);
+        if (markedSelection) {
+          await plugin.appendHighlightDiscussion(
+            markedSelection,
+            nextContext,
+            question,
+            result,
+            persistedRecord,
+            notePath,
+          );
+        }
         setMessages((current) =>
           current.map((message) =>
             message.id === assistantId
@@ -1334,9 +1401,8 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       new Notice(message);
     } finally {
       setRunning(false);
-      hideSelectionConnectorSoon();
     }
-  }, [draft, hideSelectionConnectorSoon, messages, plugin, showSelectionConnector]);
+  }, [draft, messages, plugin]);
 
   const onComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1351,7 +1417,6 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
 
   return (
     <div className="codex-reading-view">
-      <SelectionConnectorOverlay connector={connector} />
       <div className="codex-reading-header">
         <div className="codex-reading-title">Web</div>
         {contextSummary ? (
@@ -1408,7 +1473,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
         <div ref={messagesEndRef} />
       </div>
 
-      <div className="codex-chat-composer" ref={composerRef}>
+      <div className="codex-chat-composer">
         <textarea
           className="codex-chat-input"
           disabled={running}
@@ -1482,46 +1547,6 @@ function AnswerSection({ title, content }: { title: string; content?: string }) 
       <div className="codex-answer-section-title">{title}</div>
       <div>{content}</div>
     </div>
-  );
-}
-
-function SelectionConnectorOverlay({ connector }: { connector: ConnectorState | null }) {
-  if (!connector) return null;
-
-  const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
-  const viewportHeight = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
-  const direction = connector.startX > connector.endX ? -1 : 1;
-  const distance = Math.abs(connector.startX - connector.endX);
-  const controlOffset = Math.max(72, Math.min(distance * 0.42, 260));
-  const path = [
-    `M ${connector.startX} ${connector.startY}`,
-    `C ${connector.startX + direction * controlOffset} ${connector.startY}`,
-    `${connector.endX - direction * controlOffset * 0.45} ${connector.endY}`,
-    `${connector.endX} ${connector.endY}`,
-  ].join(" ");
-
-  return createPortal(
-    <div aria-hidden="true" className="codex-selection-connector" key={connector.id}>
-      <svg
-        className="codex-selection-connector-svg"
-        height={viewportHeight}
-        width={viewportWidth}
-      >
-        <path className="codex-selection-connector-path-shadow" d={path} />
-        <path className="codex-selection-connector-path" d={path} />
-      </svg>
-      <div
-        className="codex-selection-plunger"
-        style={{
-          left: connector.endX,
-          top: connector.endY,
-        }}
-      >
-        <span className="codex-selection-plunger-head" />
-        <span className="codex-selection-plunger-stick" />
-      </div>
-    </div>,
-    document.body,
   );
 }
 
@@ -2651,6 +2676,19 @@ function createMessageId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createHighlightAnchorId(): string {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:TZ.]/g, "")
+    .slice(0, 14);
+  const suffix = Math.random().toString(36).slice(2, 7);
+  return `web-hl-${stamp}-${suffix}`;
+}
+
+function formatHighlightAnchorMarkup(anchorId: string): string {
+  return `<span class="web-highlight-note" data-web-anchor="${anchorId}" title="展开 Web 讨论">✎</span>`;
+}
+
 function getCurrentDomSelectionText(): string {
   const selection = globalThis.getSelection?.();
   if (selection?.anchorNode) {
@@ -2662,30 +2700,6 @@ function getCurrentDomSelectionText(): string {
   }
   const selectedText = selection?.toString().trim() ?? "";
   return selectedText.length > 1 ? selectedText : "";
-}
-
-function getCurrentSelectionAnchorRect(): SelectionAnchorRect | null {
-  const selection = globalThis.getSelection?.();
-  if (!selection || selection.rangeCount === 0 || selection.toString().trim().length <= 1) return null;
-  const anchorElement =
-    selection.anchorNode instanceof Element
-      ? selection.anchorNode
-      : selection.anchorNode?.parentElement;
-  if (anchorElement?.closest(".codex-reading-root")) return null;
-
-  const range = selection.getRangeAt(0);
-  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
-  const rect = rects[rects.length - 1] ?? range.getBoundingClientRect();
-  if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-
-  return {
-    left: rect.left,
-    top: rect.top,
-    right: rect.right,
-    bottom: rect.bottom,
-    width: rect.width,
-    height: rect.height,
-  };
 }
 
 function cloneEditorPosition(position: EditorPosition): EditorPosition {
@@ -2700,27 +2714,33 @@ function wrapEditorRangeWithHighlight(
   filePath: string,
   from: EditorPosition,
   to: EditorPosition,
-  rect?: SelectionAnchorRect,
 ): MarkedSelectionResult | null {
   const selectedText = editor.getRange(from, to);
   if (!selectedText.trim()) return null;
   if (isEditorRangeAlreadyHighlighted(editor, from, to)) {
+    const afterHighlight = getSameLinePosition(editor, to, 2);
+    const existingAnchorId = getHighlightAnchorAfterEditorPosition(editor, afterHighlight);
+    const anchorId = existingAnchorId ?? createHighlightAnchorId();
+    if (!existingAnchorId) {
+      editor.replaceRange(formatHighlightAnchorMarkup(anchorId), afterHighlight);
+    }
     return {
       filePath,
       text: selectedText,
       startLine: from.line + 1,
       endLine: to.line + 1,
-      rect,
+      anchorId,
     };
   }
 
-  editor.replaceRange(`==${selectedText}==`, from, to);
+  const anchorId = createHighlightAnchorId();
+  editor.replaceRange(`==${selectedText}==${formatHighlightAnchorMarkup(anchorId)}`, from, to);
   return {
     filePath,
     text: selectedText,
     startLine: from.line + 1,
     endLine: to.line + 1,
-    rect,
+    anchorId,
   };
 }
 
@@ -2742,8 +2762,36 @@ function isEditorRangeAlreadyHighlighted(
   return before.endsWith("==") && after.startsWith("==");
 }
 
+function getSameLinePosition(editor: Editor, position: EditorPosition, offset: number): EditorPosition {
+  const lineLength = editor.getLine(position.line)?.length ?? position.ch;
+  return {
+    line: position.line,
+    ch: Math.max(0, Math.min(lineLength, position.ch + offset)),
+  };
+}
+
+function getHighlightAnchorAfterEditorPosition(
+  editor: Editor,
+  position: EditorPosition,
+): string | null {
+  const lineLength = editor.getLine(position.line)?.length ?? position.ch;
+  const restOfLine = editor.getRange(position, { line: position.line, ch: lineLength });
+  return getHighlightAnchorFromLeadingText(restOfLine);
+}
+
 function isContentRangeAlreadyHighlighted(content: string, start: number, end: number): boolean {
   return content.slice(Math.max(0, start - 2), start) === "==" && content.slice(end, end + 2) === "==";
+}
+
+function getHighlightAnchorAfterContentRange(content: string, offset: number): string | null {
+  return getHighlightAnchorFromLeadingText(content.slice(offset, offset + 260));
+}
+
+function getHighlightAnchorFromLeadingText(value: string): string | null {
+  const match = /^\s*<span\s+class=["']web-highlight-note["']\s+data-web-anchor=["']([^"']+)["'][^>]*>[\s\S]*?<\/span>/i.exec(
+    value,
+  );
+  return match?.[1] ?? null;
 }
 
 function findSelectionRangeInContent(
