@@ -147,7 +147,7 @@ NODE
 
 ### 右侧聊天
 
-1. 在 Obsidian 中打开一篇 Markdown 笔记。
+1. 在 Obsidian 中打开一篇 Markdown、PDF 或 EPUB 文件。
 2. 选中一段读不懂或想追问的文字。
 3. 打开命令面板，执行 `打开 Web 面板`。
 4. 在右侧底部输入框提问。
@@ -157,8 +157,8 @@ Web 会自动读取：
 
 - 当前文件
 - 当前选区
-- 光标附近段落
-- 标题路径
+- 光标附近段落，或 PDF 页码 / EPUB 章节附近文本
+- 标题路径，或 PDF 页码 / EPUB 章节
 - backlinks / outlinks
 - 最近打开文件
 - vault 内相关笔记
@@ -271,4 +271,4 @@ cat "$VAULT_PATH/.obsidian/community-plugins.json"
 
 ## 给用户的最短说明
 
-安装后，在 Obsidian 里打开一篇 Markdown，执行 `打开 Web 面板`。读到卡住的地方，选中文字，直接在右侧输入框提问。Web 会解释当前段落，并把问题、回答和相关线索自动沉淀到 `AI阅读笔记/`。
+安装后，在 Obsidian 里打开一篇 Markdown、PDF 或 EPUB，执行 `打开 Web 面板`。读到卡住的地方，选中文字，直接在右侧输入框提问。Web 会解释当前材料，并把问题、回答和相关线索自动沉淀到 `AI阅读笔记/`。

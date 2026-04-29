@@ -44,10 +44,15 @@ interface CodexReadingSettings {
   allowConceptNotes: boolean;
 }
 
+type ReadingSourceType = "markdown" | "pdf" | "epub";
+
 interface ReadingSelection {
   text: string;
   startLine: number;
   endLine: number;
+  locationLabel?: string;
+  pageNumber?: number;
+  chapterTitle?: string;
 }
 
 interface SelectionSnapshot {
@@ -55,6 +60,8 @@ interface SelectionSnapshot {
   text: string;
   from?: EditorPosition;
   to?: EditorPosition;
+  locationLabel?: string;
+  pageNumber?: number;
   capturedAt: number;
 }
 
@@ -73,12 +80,17 @@ interface HeadingItem {
 }
 
 interface ReadingContext {
+  sourceType: ReadingSourceType;
   vaultName: string;
   vaultPath: string;
   activeFilePath: string;
   activeFileName: string;
   activeFileBasename: string;
   cursorLine: number;
+  locationLabel: string;
+  pageNumber?: number;
+  totalPages?: number;
+  chapterTitle?: string;
   headingPath: HeadingItem[];
   outline: HeadingItem[];
   selection?: ReadingSelection;
@@ -181,6 +193,80 @@ interface CodexQuestionBlock {
   answerEndLine: number | null;
 }
 
+interface ExtractedTextBlock {
+  text: string;
+  lineStart: number;
+  lineEnd: number;
+  locationLabel: string;
+  pageNumber?: number;
+  chapterTitle?: string;
+}
+
+interface ExtractedReadingDocument {
+  sourceType: Exclude<ReadingSourceType, "markdown">;
+  text: string;
+  outline: HeadingItem[];
+  blocks: ExtractedTextBlock[];
+  totalPages?: number;
+}
+
+interface DocumentExtractionCacheEntry {
+  key: string;
+  document?: ExtractedReadingDocument;
+  promise?: Promise<ExtractedReadingDocument>;
+}
+
+interface DomSelectionSnapshot {
+  text: string;
+  locationLabel?: string;
+  pageNumber?: number;
+}
+
+interface TextExtractorApi {
+  extractText: (file: TFile) => Promise<string>;
+  canFileBeExtracted: (filePath: string) => boolean;
+  isInCache?: (file: TFile) => Promise<boolean>;
+}
+
+interface PdfJsModule {
+  getDocument: (src: PdfDocumentInitParameters) => PdfDocumentLoadingTask;
+  GlobalWorkerOptions?: {
+    workerSrc?: string;
+  };
+  version?: string;
+}
+
+interface PdfDocumentInitParameters {
+  data: Uint8Array;
+  useWorkerFetch?: boolean;
+  isEvalSupported?: boolean;
+  disableFontFace?: boolean;
+  useSystemFonts?: boolean;
+}
+
+interface PdfDocumentLoadingTask {
+  promise: Promise<PdfDocumentProxy>;
+}
+
+interface PdfDocumentProxy {
+  numPages: number;
+  getPage(pageNumber: number): Promise<PdfPageProxy>;
+  destroy(): Promise<void> | void;
+}
+
+interface PdfPageProxy {
+  getTextContent(): Promise<PdfTextContent>;
+}
+
+interface PdfTextContent {
+  items: unknown[];
+}
+
+interface PdfTextItem {
+  str?: string;
+  hasEOL?: boolean;
+}
+
 const DEFAULT_SETTINGS: CodexReadingSettings = {
   nodeCommand: "/Users/andreas/.local/bin/node",
   codexCommand: "/Users/andreas/.bun/bin/codex",
@@ -205,6 +291,7 @@ export default class CodexReadingPlugin extends Plugin {
   private lastMarkedText = "";
   private lastSelectionSnapshot: SelectionSnapshot | null = null;
   private highlightPopover: HTMLElement | null = null;
+  private readonly documentExtractionCache = new Map<string, DocumentExtractionCacheEntry>();
 
   async onload() {
     await this.loadSettings();
@@ -315,24 +402,33 @@ export default class CodexReadingPlugin extends Plugin {
     editor: Editor;
     file: TFile;
   }): Promise<ReadingContext> {
-    const markdownView = source ? null : this.getReadingMarkdownView();
-    const file = source?.file ?? markdownView?.file;
-    const editor = source?.editor ?? markdownView?.editor;
+    const file = source?.file ?? this.getActiveReadingFile();
 
-    if (!editor || !file) {
+    if (!file) {
+      throw new Error("请先打开一篇 Markdown、PDF 或 EPUB 文件");
+    }
+
+    const sourceType = getReadingSourceType(file);
+    if (!sourceType) {
+      throw new Error("Web 当前支持 Markdown、PDF 和 EPUB 文件");
+    }
+
+    if (sourceType !== "markdown") {
+      return this.buildExtractedDocumentReadingContext(file, sourceType);
+    }
+
+    const markdownView = source ? null : this.getReadingMarkdownView(file.path);
+    const editor = source?.editor ?? markdownView?.editor;
+    if (!editor) {
       throw new Error("请先打开一篇 Markdown 笔记");
     }
-
-    if (file.extension !== "md") {
-      throw new Error("第一版先支持 Markdown 笔记；PDF、EPUB 和网页剪藏会作为后续格式层加入");
-    }
-
     const content = await this.app.vault.read(file);
     const cursor = editor.getCursor();
     const selectionSnapshot = this.getUsableSelectionSnapshot(file.path);
     const editorSelection = editor.getSelection();
+    const domSelection = getCurrentDomSelectionSnapshot();
     const selectedText =
-      editorSelection || getCurrentDomSelectionText() || selectionSnapshot?.text;
+      editorSelection || domSelection?.text || selectionSnapshot?.text;
     const selection = selectedText
       ? {
           text: trimToLimit(selectedText, this.settings.maxContextChars),
@@ -353,12 +449,14 @@ export default class CodexReadingPlugin extends Plugin {
     );
 
     return {
+      sourceType,
       vaultName: this.app.vault.getName(),
       vaultPath: this.getVaultPath(),
       activeFilePath: file.path,
       activeFileName: file.name,
       activeFileBasename: file.basename,
       cursorLine: cursor.line + 1,
+      locationLabel: formatLineLocation(cursor.line + 1),
       headingPath: getHeadingPath(lines, cursor.line),
       outline: getOutline(lines),
       selection,
@@ -369,10 +467,106 @@ export default class CodexReadingPlugin extends Plugin {
     };
   }
 
+  private async buildExtractedDocumentReadingContext(
+    file: TFile,
+    sourceType: Exclude<ReadingSourceType, "markdown">,
+  ): Promise<ReadingContext> {
+    const document = await this.getExtractedReadingDocument(file, sourceType);
+    const selectionSnapshot = this.getUsableSelectionSnapshot(file.path);
+    const domSelection = getCurrentDomSelectionSnapshot();
+    const selectedText = domSelection?.text || selectionSnapshot?.text || "";
+    const preferredPageNumber = domSelection?.pageNumber ?? selectionSnapshot?.pageNumber;
+    const locatedSelection = selectedText
+      ? locateSelectionInExtractedDocument(document, selectedText, preferredPageNumber)
+      : null;
+    const activeBlock = locatedSelection?.block ?? getDefaultExtractedTextBlock(document);
+    const cursorLine = locatedSelection?.startLine ?? activeBlock?.lineStart ?? 1;
+    const locationLabel =
+      locatedSelection?.locationLabel ??
+      domSelection?.locationLabel ??
+      selectionSnapshot?.locationLabel ??
+      activeBlock?.locationLabel ??
+      "文档开头";
+    const pageNumber = locatedSelection?.pageNumber ?? preferredPageNumber ?? activeBlock?.pageNumber;
+    const chapterTitle = locatedSelection?.chapterTitle ?? activeBlock?.chapterTitle;
+    const selection = selectedText
+      ? {
+          text: trimToLimit(selectedText, this.settings.maxContextChars),
+          startLine: locatedSelection?.startLine ?? activeBlock?.lineStart ?? 1,
+          endLine: locatedSelection?.endLine ?? activeBlock?.lineEnd ?? 1,
+          locationLabel,
+          pageNumber,
+          chapterTitle,
+        }
+      : undefined;
+
+    return {
+      sourceType,
+      vaultName: this.app.vault.getName(),
+      vaultPath: this.getVaultPath(),
+      activeFilePath: file.path,
+      activeFileName: file.name,
+      activeFileBasename: file.basename,
+      cursorLine,
+      locationLabel,
+      pageNumber,
+      totalPages: document.totalPages,
+      chapterTitle,
+      headingPath: buildExtractedHeadingPath(activeBlock),
+      outline: document.outline,
+      selection,
+      surroundingText: buildExtractedSurroundingText(
+        document,
+        activeBlock,
+        this.settings.maxContextChars,
+      ),
+      fileExcerpt: buildFileExcerpt(document.text, cursorLine - 1, this.settings.maxContextChars),
+      agentMemoryExcerpt: undefined,
+      capturedAt: new Date().toISOString(),
+    };
+  }
+
+  private async getExtractedReadingDocument(
+    file: TFile,
+    sourceType: Exclude<ReadingSourceType, "markdown">,
+  ): Promise<ExtractedReadingDocument> {
+    const key = `${file.stat.mtime}:${file.stat.size}`;
+    const cached = this.documentExtractionCache.get(file.path);
+    if (cached?.key === key) {
+      if (cached.document) return cached.document;
+      if (cached.promise) return cached.promise;
+    }
+
+    const promise = this.extractReadingDocument(file, sourceType)
+      .then((document) => {
+        this.documentExtractionCache.set(file.path, { key, document });
+        return document;
+      })
+      .catch((error) => {
+        this.documentExtractionCache.delete(file.path);
+        throw error;
+      });
+
+    this.documentExtractionCache.set(file.path, { key, promise });
+    return promise;
+  }
+
+  private async extractReadingDocument(
+    file: TFile,
+    sourceType: Exclude<ReadingSourceType, "markdown">,
+  ): Promise<ExtractedReadingDocument> {
+    const data = await this.app.vault.readBinary(file);
+    if (sourceType === "pdf") {
+      return extractPdfReadingDocument(file, data, getTextExtractor(this.app));
+    }
+    return extractEpubReadingDocument(file, data);
+  }
+
   async markActiveSelection(context: ReadingContext): Promise<MarkedSelectionResult | null> {
     if (!context.selection?.text.trim()) return null;
+    if (context.sourceType !== "markdown") return null;
 
-    const markdownView = this.getReadingMarkdownView();
+    const markdownView = this.getReadingMarkdownView(context.activeFilePath);
     const file = markdownView?.file;
     const editor = markdownView?.editor;
     if (!file || !editor || file.path !== context.activeFilePath) return null;
@@ -429,7 +623,7 @@ export default class CodexReadingPlugin extends Plugin {
       backlinks,
       recentFiles,
       relatedNotes,
-      availableActions: getAvailableActions(this.settings),
+      availableActions: getAvailableActions(this.settings, context.sourceType),
       agentMemoryExcerpt: await this.readAgentMemoryExcerpt(context, relatedNotes, query),
     };
   }
@@ -515,7 +709,7 @@ export default class CodexReadingPlugin extends Plugin {
     const targetPath = this.getCompanionNotePath(context);
     await this.ensureFolder(this.settings.noteFolder);
 
-    const sourceLink = `[[${context.activeFilePath.replace(/\.md$/, "")}|${context.activeFileName}]]`;
+    const sourceLink = formatWikiLink(context.activeFilePath, context.activeFileName);
     const selectedBlock = context.selection
       ? `\n**选区**\n\n> ${context.selection.text.replace(/\n/g, "\n> ")}\n`
       : "";
@@ -525,7 +719,7 @@ export default class CodexReadingPlugin extends Plugin {
       `## ${formatLocalDateTime(new Date())} 精读记录`,
       "",
       `**来源**: ${sourceLink}`,
-      `**位置**: 第 ${context.cursorLine} 行`,
+      `**位置**: ${formatContextLocation(context)}`,
       `**标题路径**: ${headingText}`,
       blockId ? `**问题锚点**: ^${blockId}` : null,
       selectedBlock,
@@ -638,7 +832,7 @@ export default class CodexReadingPlugin extends Plugin {
     const concepts = extractConceptLabels(response).join("、") || "无";
     const entry = [
       `- ${formatLocalDateTime(createdAt)} ${nodeLink}`,
-      `  - 来源：${sourceLink}，第 ${context.cursorLine} 行`,
+      `  - 来源：${sourceLink}，${formatContextLocation(context)}`,
       `  - 概念：${concepts}`,
       `  - 阅读线索：${trailText}`,
     ].join("\n");
@@ -944,12 +1138,21 @@ export default class CodexReadingPlugin extends Plugin {
     return basePath;
   }
 
-  private getReadingMarkdownView(): MarkdownView | null {
+  private getActiveReadingFile(): TFile | null {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile && getReadingSourceType(activeFile)) return activeFile;
+
+    const markdownView = this.getReadingMarkdownView();
+    if (markdownView?.file && getReadingSourceType(markdownView.file)) return markdownView.file;
+    return null;
+  }
+
+  private getReadingMarkdownView(filePath?: string): MarkdownView | null {
     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (activeView) return activeView;
+    if (activeView && (!filePath || activeView.file?.path === filePath)) return activeView;
 
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
-      if (leaf.view instanceof MarkdownView) {
+      if (leaf.view instanceof MarkdownView && (!filePath || leaf.view.file?.path === filePath)) {
         return leaf.view;
       }
     }
@@ -1031,23 +1234,25 @@ export default class CodexReadingPlugin extends Plugin {
   }
 
   private captureSelectionSnapshot() {
-    const selectedText = getCurrentDomSelectionText();
-    if (!selectedText) return;
+    const domSelection = getCurrentDomSelectionSnapshot();
+    if (!domSelection?.text) return;
 
-    const markdownView = this.getReadingMarkdownView();
-    const file = markdownView?.file;
+    const file = this.getActiveReadingFile();
     if (!file) return;
 
-    const editor = markdownView.editor;
-    const editorSelection = editor.getSelection();
+    const markdownView = getReadingSourceType(file) === "markdown" ? this.getReadingMarkdownView(file.path) : null;
+    const editor = markdownView?.editor;
+    const editorSelection = editor?.getSelection() ?? "";
     const hasEditorSelection = Boolean(editorSelection.trim());
 
-    this.lastMarkedText = trimToLimit(selectedText, this.settings.maxContextChars);
+    this.lastMarkedText = trimToLimit(domSelection.text, this.settings.maxContextChars);
     this.lastSelectionSnapshot = {
       filePath: file.path,
       text: this.lastMarkedText,
-      from: hasEditorSelection ? cloneEditorPosition(editor.getCursor("from")) : undefined,
-      to: hasEditorSelection ? cloneEditorPosition(editor.getCursor("to")) : undefined,
+      from: hasEditorSelection && editor ? cloneEditorPosition(editor.getCursor("from")) : undefined,
+      to: hasEditorSelection && editor ? cloneEditorPosition(editor.getCursor("to")) : undefined,
+      locationLabel: domSelection.locationLabel,
+      pageNumber: domSelection.pageNumber,
       capturedAt: Date.now(),
     };
   }
@@ -1123,7 +1328,7 @@ export default class CodexReadingPlugin extends Plugin {
       "",
       `## ${formatLocalDateTime(new Date())}`,
       "",
-      `- 来源：${sourceLink}，第 ${anchor.startLine}-${anchor.endLine} 行`,
+      `- 来源：${sourceLink}，${formatMarkedSelectionLocation(anchor, context)}`,
       `- 问题节点：${questionNodeLink}`,
       `- 阅读笔记：${readingNoteLink}`,
       `- 阅读线索：${trailLinks}`,
@@ -1151,7 +1356,7 @@ export default class CodexReadingPlugin extends Plugin {
         `# 高亮批注 ${anchor.anchorId}`,
         "",
         `来源：${sourceLink}`,
-        `位置：第 ${anchor.startLine}-${anchor.endLine} 行`,
+        `位置：${formatMarkedSelectionLocation(anchor, context)}`,
         "",
         "这个文件由 Web 自动维护，用来保存同一处高亮上的连续问题和讨论。",
         "",
@@ -1269,14 +1474,14 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
 
   const contextSummary = useMemo(() => {
     if (!context) return null;
-    return {
-      source: context.activeFilePath,
-      heading: context.headingPath.map((heading) => heading.text).join(" / ") || "无",
-      selection: context.selection?.text
-        ? trimToLimit(context.selection.text.replace(/\s+/g, " "), 220)
-        : "无选区",
-      line: context.cursorLine,
-    };
+      return {
+        source: context.activeFilePath,
+        heading: context.headingPath.map((heading) => heading.text).join(" / ") || "无",
+        selection: context.selection?.text
+          ? trimToLimit(context.selection.text.replace(/\s+/g, " "), 220)
+          : "无选区",
+        location: formatContextLocation(context),
+      };
   }, [context]);
 
   const refreshContextQuietly = useCallback(async () => {
@@ -1422,11 +1627,11 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
         {contextSummary ? (
           <div className="codex-reading-context-line">
             <span>{contextSummary.source}</span>
-            <span>第 {contextSummary.line} 行</span>
+            <span>{contextSummary.location}</span>
             <span>{contextSummary.selection === "无选区" ? "未标注" : "已标注"}</span>
           </div>
         ) : (
-          <div className="codex-reading-context-line">打开 Markdown 后即可提问</div>
+          <div className="codex-reading-context-line">打开 Markdown、PDF 或 EPUB 后即可提问</div>
         )}
       </div>
 
@@ -1830,9 +2035,14 @@ function getBacklinks(app: App, file: TFile): string[] {
   return backlinks;
 }
 
-function getAvailableActions(settings: CodexReadingSettings): NoteAction["type"][] {
+function getAvailableActions(
+  settings: CodexReadingSettings,
+  sourceType: ReadingSourceType,
+): NoteAction["type"][] {
   const actions: NoteAction["type"][] = ["appendReadingNote", "openRelatedNote"];
-  actions.push("insertAnswerCallout");
+  if (sourceType === "markdown") {
+    actions.push("insertAnswerCallout");
+  }
   if (settings.allowConceptNotes) {
     actions.push("createConceptNote");
   }
@@ -2340,7 +2550,10 @@ function formatQuestionNodeMarkdown(
     "---",
     `created: ${createdAt.toISOString()}`,
     `source: ${JSON.stringify(context.activeFilePath)}`,
+    `sourceType: ${context.sourceType}`,
     `line: ${context.cursorLine}`,
+    `location: ${JSON.stringify(formatContextLocation(context))}`,
+    context.pageNumber ? `page: ${context.pageNumber}` : null,
     `concepts: ${JSON.stringify(concepts)}`,
     `trails: ${JSON.stringify(trails)}`,
     "---",
@@ -2350,7 +2563,7 @@ function formatQuestionNodeMarkdown(
     "## 阅读现场",
     "",
     `- 来源：${sourceLink}`,
-    `- 位置：第 ${context.cursorLine} 行`,
+    `- 位置：${formatContextLocation(context)}`,
     `- 标题路径：${headingText}`,
     selection ? "" : null,
     selection ? "**选区**" : null,
@@ -2391,7 +2604,7 @@ function formatReadingTrailEntry(
     `### ${formatLocalDateTime(createdAt)}`,
     "",
     `- 问题节点：${formatWikiLink(questionNodePath, trimToLimit(question.replace(/\s+/g, " "), 42))}`,
-    `- 来源：${formatWikiLink(context.activeFilePath, context.activeFileName)}，第 ${context.cursorLine} 行`,
+    `- 来源：${formatWikiLink(context.activeFilePath, context.activeFileName)}，${formatContextLocation(context)}`,
     `- 关联原因：${trail.reason}`,
     `- 概念：${concepts}`,
     "",
@@ -2411,6 +2624,20 @@ function formatWikiLink(path: string, alias?: string): string {
   const target = normalizePath(path).replace(/\.md$/, "");
   const safeAlias = alias?.replace(/[\]\|]/g, "/").trim();
   return safeAlias ? `[[${target}|${safeAlias}]]` : `[[${target}]]`;
+}
+
+function formatLineLocation(line: number): string {
+  return `第 ${Math.max(1, line)} 行`;
+}
+
+function formatContextLocation(context: ReadingContext): string {
+  if (context.locationLabel?.trim()) return context.locationLabel;
+  return formatLineLocation(context.cursorLine);
+}
+
+function formatMarkedSelectionLocation(anchor: MarkedSelectionResult, context: ReadingContext): string {
+  if (context.selection?.locationLabel) return context.selection.locationLabel;
+  return `第 ${anchor.startLine}-${anchor.endLine} 行`;
 }
 
 function blockquoteMarkdown(value: string): string {
@@ -2499,6 +2726,525 @@ function getHeadingPath(lines: string[], cursorLine: number): HeadingItem[] {
     stack.push(heading);
   }
   return stack;
+}
+
+function getReadingSourceType(file: TFile): ReadingSourceType | null {
+  const extension = file.extension.toLowerCase();
+  if (extension === "md") return "markdown";
+  if (extension === "pdf") return "pdf";
+  if (extension === "epub") return "epub";
+  return null;
+}
+
+async function extractPdfReadingDocument(
+  file: TFile,
+  data: ArrayBuffer,
+  textExtractor?: TextExtractorApi,
+): Promise<ExtractedReadingDocument> {
+  try {
+    const pdfjsLib = (await import("pdfjs-dist/legacy/build/pdf.mjs")) as unknown as PdfJsModule;
+    const pdf = await pdfjsLib.getDocument({
+      data: new Uint8Array(data.slice(0)),
+      useWorkerFetch: false,
+      isEvalSupported: false,
+      disableFontFace: true,
+      useSystemFonts: false,
+    }).promise;
+
+    try {
+      const inputs: ExtractedBlockInput[] = [];
+      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+        const page = await pdf.getPage(pageNumber);
+        const textContent = await page.getTextContent();
+        const pageText = extractPdfPageText(textContent.items);
+        if (!pageText.trim()) continue;
+
+        inputs.push({
+          heading: `第 ${pageNumber} 页`,
+          text: pageText,
+          locationLabel: `第 ${pageNumber} 页`,
+          pageNumber,
+          outlineLevel: 1,
+        });
+      }
+
+      if (inputs.length > 0) {
+        return buildExtractedReadingDocument("pdf", inputs, pdf.numPages);
+      }
+    } finally {
+      await pdf.destroy();
+    }
+  } catch (error) {
+    const fallbackText = await extractPdfTextWithCompanionPlugin(file, textExtractor);
+    if (fallbackText.trim()) {
+      return buildPlainExtractedReadingDocument(
+        "pdf",
+        fallbackText,
+        "PDF 文本",
+        "PDF 文本",
+      );
+    }
+    throw new Error(`无法抽取 PDF 文本：${toErrorMessage(error)}`);
+  }
+
+  const fallbackText = await extractPdfTextWithCompanionPlugin(file, textExtractor);
+  if (fallbackText.trim()) {
+    return buildPlainExtractedReadingDocument("pdf", fallbackText, "PDF 文本", "PDF 文本");
+  }
+
+  return buildPlainExtractedReadingDocument(
+    "pdf",
+    "这个 PDF 没有抽取到可用文本。若它是扫描版，请先做 OCR，或在 PDF 里选中一段可复制文字后再提问。",
+    "PDF 文本",
+    "PDF 文本不可用",
+  );
+}
+
+async function extractPdfTextWithCompanionPlugin(
+  file: TFile,
+  textExtractor?: TextExtractorApi,
+): Promise<string> {
+  if (!textExtractor?.canFileBeExtracted(file.path)) return "";
+  try {
+    return await textExtractor.extractText(file);
+  } catch {
+    return "";
+  }
+}
+
+function extractPdfPageText(items: unknown[]): string {
+  const lines: string[] = [];
+  let currentLine: string[] = [];
+
+  const pushLine = () => {
+    const line = normalizePdfLine(currentLine);
+    if (line) lines.push(line);
+    currentLine = [];
+  };
+
+  for (const item of items) {
+    const textItem = asPdfTextItem(item);
+    if (!textItem) continue;
+    const text = textItem.str?.replace(/\s+/g, " ").trim();
+    if (text) currentLine.push(text);
+    if (textItem.hasEOL) pushLine();
+  }
+  pushLine();
+
+  return normalizeExtractedText(lines.join("\n"));
+}
+
+function asPdfTextItem(value: unknown): PdfTextItem | null {
+  const record = asRecord(value);
+  if (!record || typeof record.str !== "string") return null;
+  return {
+    str: record.str,
+    hasEOL: record.hasEOL === true,
+  };
+}
+
+function normalizePdfLine(parts: string[]): string {
+  return parts
+    .join(" ")
+    .replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, "$1")
+    .replace(/\s+([，。！？、；：）】》])/g, "$1")
+    .replace(/([（【《])\s+/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function extractEpubReadingDocument(
+  file: TFile,
+  data: ArrayBuffer,
+): Promise<ExtractedReadingDocument> {
+  const { configure, ZipReader, BlobReader, TextWriter } = await import("@zip.js/zip.js");
+  configure({ useWebWorkers: false });
+
+  const reader = new ZipReader(new BlobReader(new Blob([data])));
+  try {
+    const entries = await reader.getEntries();
+    const entryMap = new Map(entries.map((entry) => [normalizeArchivePath(entry.filename), entry]));
+    const readTextEntry = async (entryPath: string): Promise<string | null> => {
+      const entry = findZipEntry(entryMap, entryPath);
+      if (!entry || entry.directory || !entry.getData) return null;
+      return entry.getData(new TextWriter());
+    };
+
+    const containerXml = await readTextEntry("META-INF/container.xml");
+    if (!containerXml) {
+      throw new Error("EPUB 缺少 META-INF/container.xml");
+    }
+
+    const containerDoc = parseXmlDocument(containerXml);
+    const rootfilePath = containerDoc.querySelector("rootfile")?.getAttribute("full-path");
+    if (!rootfilePath) {
+      throw new Error("EPUB 缺少 OPF rootfile");
+    }
+
+    const opfPath = normalizeArchivePath(rootfilePath);
+    const opfText = await readTextEntry(opfPath);
+    if (!opfText) {
+      throw new Error(`EPUB 无法读取 OPF：${opfPath}`);
+    }
+
+    const opfDoc = parseXmlDocument(opfText);
+    const opfDir = getArchiveDirectory(opfPath);
+    const metadataTitle =
+      opfDoc.querySelector("metadata > title, metadata > dc\\:title")?.textContent?.trim() ??
+      file.basename;
+    const manifest = parseEpubManifest(opfDoc, opfDir);
+    const spineItems = Array.from(opfDoc.querySelectorAll("spine > itemref"))
+      .map((item) => item.getAttribute("idref") ?? "")
+      .filter(Boolean)
+      .map((idref) => manifest.get(idref))
+      .filter((item): item is EpubManifestItem => Boolean(item));
+
+    const inputs: ExtractedBlockInput[] = [];
+    for (const item of spineItems) {
+      if (!isEpubContentDocument(item.href, item.mediaType)) continue;
+      const html = await readTextEntry(item.path);
+      if (!html) continue;
+
+      const htmlDoc = new DOMParser().parseFromString(html, "text/html");
+      const chapterTitle = getHtmlDocumentTitle(htmlDoc) || item.title || metadataTitle;
+      const chapterText = extractHtmlDocumentText(htmlDoc);
+      if (!chapterText.trim()) continue;
+
+      inputs.push({
+        heading: chapterTitle,
+        text: chapterText,
+        locationLabel: chapterTitle,
+        chapterTitle,
+        outlineLevel: 1,
+      });
+    }
+
+    if (inputs.length === 0) {
+      return buildPlainExtractedReadingDocument(
+        "epub",
+        "这个 EPUB 没有抽取到可用正文。可能是图片型 EPUB，或正文结构不符合常见 EPUB 规范。",
+        metadataTitle,
+        "EPUB 文本不可用",
+      );
+    }
+
+    return buildExtractedReadingDocument("epub", inputs);
+  } finally {
+    await reader.close();
+  }
+}
+
+interface EpubManifestItem {
+  id: string;
+  href: string;
+  path: string;
+  mediaType: string;
+  title?: string;
+}
+
+function parseEpubManifest(doc: Document, opfDir: string): Map<string, EpubManifestItem> {
+  const manifest = new Map<string, EpubManifestItem>();
+  for (const item of Array.from(doc.querySelectorAll("manifest > item"))) {
+    const id = item.getAttribute("id") ?? "";
+    const href = item.getAttribute("href") ?? "";
+    if (!id || !href) continue;
+    manifest.set(id, {
+      id,
+      href,
+      path: resolveArchivePath(opfDir, href),
+      mediaType: item.getAttribute("media-type") ?? "",
+      title: item.getAttribute("title") ?? undefined,
+    });
+  }
+  return manifest;
+}
+
+function isEpubContentDocument(href: string, mediaType: string): boolean {
+  const lowerHref = href.toLowerCase();
+  return (
+    mediaType.includes("xhtml") ||
+    mediaType.includes("html") ||
+    lowerHref.endsWith(".xhtml") ||
+    lowerHref.endsWith(".html") ||
+    lowerHref.endsWith(".htm")
+  );
+}
+
+function parseXmlDocument(xml: string): Document {
+  return new DOMParser().parseFromString(xml, "application/xml");
+}
+
+function getHtmlDocumentTitle(doc: Document): string {
+  const heading = doc.querySelector("h1, h2, h3")?.textContent?.trim();
+  if (heading) return normalizeInlineText(heading);
+  const title = doc.querySelector("title")?.textContent?.trim();
+  return title ? normalizeInlineText(title) : "";
+}
+
+function extractHtmlDocumentText(doc: Document): string {
+  doc.querySelectorAll("script, style, noscript").forEach((element) => element.remove());
+  const blockSelector =
+    "h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, td, th, dd, dt, figcaption";
+  const blocks = Array.from(doc.body?.querySelectorAll(blockSelector) ?? []);
+
+  if (blocks.length === 0) {
+    return normalizeExtractedText(doc.body?.textContent ?? "");
+  }
+
+  const lines: string[] = [];
+  for (const block of blocks) {
+    const text = normalizeInlineText(block.textContent ?? "");
+    if (!text) continue;
+    const tagName = block.tagName.toLowerCase();
+    if (/^h[1-6]$/.test(tagName)) {
+      const level = Number(tagName.slice(1));
+      lines.push(`${"#".repeat(Math.min(level, 6))} ${text}`);
+    } else if (tagName === "li") {
+      lines.push(`- ${text}`);
+    } else {
+      lines.push(text);
+    }
+  }
+
+  return normalizeExtractedText(lines.join("\n\n"));
+}
+
+interface ExtractedBlockInput {
+  heading: string;
+  text: string;
+  locationLabel: string;
+  outlineLevel: number;
+  pageNumber?: number;
+  chapterTitle?: string;
+}
+
+function buildPlainExtractedReadingDocument(
+  sourceType: Exclude<ReadingSourceType, "markdown">,
+  text: string,
+  heading: string,
+  locationLabel: string,
+): ExtractedReadingDocument {
+  return buildExtractedReadingDocument(sourceType, [
+    {
+      heading,
+      text,
+      locationLabel,
+      outlineLevel: 1,
+    },
+  ]);
+}
+
+function buildExtractedReadingDocument(
+  sourceType: Exclude<ReadingSourceType, "markdown">,
+  inputs: ExtractedBlockInput[],
+  totalPages?: number,
+): ExtractedReadingDocument {
+  const parts: string[] = [];
+  const blocks: ExtractedTextBlock[] = [];
+  const outline: HeadingItem[] = [];
+  let lineCursor = 1;
+
+  for (const input of inputs) {
+    const normalizedText = normalizeExtractedText(input.text);
+    if (!normalizedText) continue;
+    if (parts.length > 0) lineCursor += 2;
+
+    const blockText = [`## ${input.heading}`, normalizedText].filter(Boolean).join("\n");
+    const lineStart = lineCursor;
+    const lineCount = blockText.split(/\r?\n/).length;
+    const lineEnd = lineStart + lineCount - 1;
+
+    parts.push(blockText);
+    blocks.push({
+      text: blockText,
+      lineStart,
+      lineEnd,
+      locationLabel: input.locationLabel,
+      pageNumber: input.pageNumber,
+      chapterTitle: input.chapterTitle ?? input.heading,
+    });
+    outline.push({
+      level: input.outlineLevel,
+      text: input.heading,
+      line: lineStart,
+    });
+    lineCursor = lineEnd;
+  }
+
+  const text = parts.join("\n\n");
+  return {
+    sourceType,
+    text,
+    outline,
+    blocks,
+    totalPages,
+  };
+}
+
+function locateSelectionInExtractedDocument(
+  document: ExtractedReadingDocument,
+  selectedText: string,
+  preferredPageNumber?: number,
+): (ExtractedTextBlock & { block: ExtractedTextBlock; startLine: number; endLine: number }) | null {
+  const normalizedSelection = normalizeForSearch(selectedText);
+  if (!normalizedSelection) return null;
+
+  const preferredBlocks =
+    preferredPageNumber !== undefined
+      ? document.blocks.filter((block) => block.pageNumber === preferredPageNumber)
+      : [];
+  const searchBlocks = [...preferredBlocks, ...document.blocks.filter((block) => !preferredBlocks.includes(block))];
+
+  for (const block of searchBlocks) {
+    if (normalizeForSearch(block.text).includes(normalizedSelection)) {
+      return {
+        ...block,
+        block,
+        startLine: block.lineStart,
+        endLine: block.lineEnd,
+      };
+    }
+  }
+
+  const range = findSelectionRangeInContent(document.text, selectedText, 1);
+  if (!range) return null;
+  const startLine = getLineNumberAtOffset(document.text, range.start);
+  const endLine = getLineNumberAtOffset(document.text, range.end);
+  const block = findExtractedBlockByLine(document, startLine) ?? getDefaultExtractedTextBlock(document);
+  if (!block) return null;
+
+  return {
+    ...block,
+    block,
+    startLine,
+    endLine,
+  };
+}
+
+function findExtractedBlockByLine(
+  document: ExtractedReadingDocument,
+  line: number,
+): ExtractedTextBlock | null {
+  return (
+    document.blocks.find((block) => line >= block.lineStart && line <= block.lineEnd) ??
+    null
+  );
+}
+
+function getDefaultExtractedTextBlock(document: ExtractedReadingDocument): ExtractedTextBlock | null {
+  return document.blocks[0] ?? null;
+}
+
+function buildExtractedHeadingPath(block?: ExtractedTextBlock | null): HeadingItem[] {
+  if (!block) return [];
+  return [
+    {
+      level: 1,
+      text: block.chapterTitle ?? block.locationLabel,
+      line: block.lineStart,
+    },
+  ];
+}
+
+function buildExtractedSurroundingText(
+  document: ExtractedReadingDocument,
+  activeBlock: ExtractedTextBlock | null,
+  maxChars: number,
+): string {
+  if (!activeBlock) return trimToLimit(document.text, maxChars);
+  const index = document.blocks.indexOf(activeBlock);
+  if (index < 0) return trimToLimit(activeBlock.text, maxChars);
+
+  let start = index;
+  let end = index;
+  let parts = [activeBlock.text];
+
+  while (parts.join("\n\n").length < maxChars && (start > 0 || end < document.blocks.length - 1)) {
+    if (start > 0) {
+      start -= 1;
+      parts = [document.blocks[start].text, ...parts];
+    }
+    if (parts.join("\n\n").length >= maxChars) break;
+    if (end < document.blocks.length - 1) {
+      end += 1;
+      parts = [...parts, document.blocks[end].text];
+    }
+  }
+
+  return trimToLimit(parts.join("\n\n"), maxChars);
+}
+
+function normalizeExtractedText(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeInlineText(value: string): string {
+  return value.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function normalizeForSearch(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeArchivePath(path: string): string {
+  return path.replace(/^\/+/, "").replace(/\\/g, "/");
+}
+
+function getArchiveDirectory(path: string): string {
+  const normalized = normalizeArchivePath(path);
+  const index = normalized.lastIndexOf("/");
+  return index >= 0 ? normalized.slice(0, index) : "";
+}
+
+function resolveArchivePath(baseDir: string, href: string): string {
+  const cleanHref = href.split("#")[0].split("?")[0];
+  const combined = normalizeArchivePath(baseDir ? `${baseDir}/${cleanHref}` : cleanHref);
+  const parts: string[] = [];
+  for (const part of combined.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/");
+}
+
+function findZipEntry<T extends { filename: string; directory?: boolean }>(
+  entries: Map<string, T>,
+  path: string,
+): T | null {
+  const normalized = normalizeArchivePath(path);
+  const direct = entries.get(normalized);
+  if (direct) return direct;
+
+  try {
+    const decoded = decodeURIComponent(normalized);
+    return entries.get(decoded) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getTextExtractor(app: App): TextExtractorApi | undefined {
+  const appRecord = app as unknown as {
+    plugins?: {
+      plugins?: Record<string, { api?: unknown }>;
+    };
+  };
+  const api = appRecord.plugins?.plugins?.["text-extractor"]?.api;
+  const record = asRecord(api);
+  if (!record) return undefined;
+  if (typeof record.extractText !== "function" || typeof record.canFileBeExtracted !== "function") {
+    return undefined;
+  }
+  return record as unknown as TextExtractorApi;
 }
 
 function findQuestionBlockAtCursor(editor: Editor): CodexQuestionBlock | null {
@@ -2689,17 +3435,46 @@ function formatHighlightAnchorMarkup(anchorId: string): string {
   return `<span class="web-highlight-note" data-web-anchor="${anchorId}" title="展开 Web 讨论">✎</span>`;
 }
 
-function getCurrentDomSelectionText(): string {
-  const selection = globalThis.getSelection?.();
-  if (selection?.anchorNode) {
-    const anchorElement =
-      selection.anchorNode instanceof Element
-        ? selection.anchorNode
-        : selection.anchorNode.parentElement;
-    if (anchorElement?.closest(".codex-reading-root")) return "";
+function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
+  const windows: Window[] = [window];
+  for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
+    try {
+      if (iframe.contentWindow) windows.push(iframe.contentWindow);
+    } catch {
+      // 跨域 iframe 不能读取选区，直接跳过。
+    }
   }
-  const selectedText = selection?.toString().trim() ?? "";
-  return selectedText.length > 1 ? selectedText : "";
+
+  for (const targetWindow of windows) {
+    const selection = targetWindow.getSelection?.();
+    const selectedText = selection?.toString().trim() ?? "";
+    if (selectedText.length <= 1) continue;
+
+    const anchorElement = getSelectionAnchorElement(selection);
+    if (anchorElement?.closest(".codex-reading-root")) continue;
+    const pageElement = anchorElement?.closest<HTMLElement>("[data-page-number]");
+    const pageNumber = parseOptionalPositiveInteger(pageElement?.dataset.pageNumber);
+    return {
+      text: selectedText,
+      pageNumber,
+      locationLabel: pageNumber ? `第 ${pageNumber} 页` : undefined,
+    };
+  }
+
+  return null;
+}
+
+function getSelectionAnchorElement(selection: Selection | null): Element | null {
+  const anchorNode = selection?.anchorNode;
+  if (!anchorNode) return null;
+  if (anchorNode instanceof Element) return anchorNode;
+  return anchorNode.parentElement;
+}
+
+function parseOptionalPositiveInteger(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function cloneEditorPosition(position: EditorPosition): EditorPosition {
