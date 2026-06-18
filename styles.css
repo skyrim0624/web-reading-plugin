@@ -675,11 +675,15 @@ body.think-anytime-immersive .pdf-viewer {
 }
 
 .web-reading-overlay-highlight {
+  appearance: none;
+  -webkit-appearance: none;
   background: color-mix(in srgb, #ffd84d, transparent 48%);
   border: 0;
   border-radius: 3px;
+  box-sizing: border-box;
   box-shadow: 0 0 0 1px color-mix(in srgb, #c99700, transparent 52%);
   cursor: pointer;
+  display: block;
   margin: 0;
   padding: 0;
   pointer-events: auto;

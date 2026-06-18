@@ -848,14 +848,11 @@ export default class CodexReadingPlugin extends Plugin {
       rects,
     };
 
-    if (rects?.length) {
-      this.renderTransientHighlightOverlay(anchorId, rects);
-    }
-
     const file = this.app.vault.getAbstractFileByPath(context.activeFilePath);
     if (file instanceof TFile) {
       await this.writeCurrentSelectionBridgeFile(file, selection, anchorId);
     }
+    clearDomSelections();
 
     return result;
   }
@@ -1650,9 +1647,6 @@ export default class CodexReadingPlugin extends Plugin {
       sourceType && sourceType !== "markdown"
         ? createDocumentHighlightAnchorId(file.path, this.lastSelectionSnapshot)
         : undefined;
-    if (anchorId && domSelection.rects?.length) {
-      this.renderTransientHighlightOverlay(anchorId, domSelection.rects);
-    }
     void this.writeCurrentSelectionBridgeFile(file, this.lastSelectionSnapshot, anchorId);
   }
 
@@ -1705,10 +1699,11 @@ export default class CodexReadingPlugin extends Plugin {
     layer.empty();
 
     for (const rect of visibleRects) {
-      const marker = document.createElement("button");
-      marker.type = "button";
+      const marker = document.createElement("span");
       marker.className = "web-reading-overlay-highlight";
       marker.dataset.webAnchor = anchorId;
+      marker.tabIndex = 0;
+      marker.setAttribute("role", "button");
       marker.setAttribute("aria-label", `打开 ${PLUGIN_DISPLAY_NAME} 高亮批注`);
       marker.style.left = `${rect.left}px`;
       marker.style.top = `${rect.top}px`;
@@ -1847,6 +1842,9 @@ export default class CodexReadingPlugin extends Plugin {
       await this.app.vault.create(targetPath, nextContent);
     }
     await this.savePluginData();
+    if (context.sourceType !== "markdown" && anchor.rects?.length) {
+      this.renderTransientHighlightOverlay(anchor.anchorId, anchor.rects);
+    }
 
     return targetPath;
   }
@@ -4660,6 +4658,25 @@ function getSelectionRects(
   }
 
   return rects.slice(0, 80);
+}
+
+function clearDomSelections() {
+  const windows: Window[] = [window];
+  for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
+    try {
+      if (iframe.contentWindow) windows.push(iframe.contentWindow);
+    } catch {
+      // 跨域 iframe 不能读取选区，直接跳过。
+    }
+  }
+
+  for (const targetWindow of windows) {
+    try {
+      targetWindow.getSelection?.()?.removeAllRanges();
+    } catch {
+      // 跨域 iframe 不能读取选区，直接跳过。
+    }
+  }
 }
 
 function getSelectionAnchorElement(selection: Selection | null): Element | null {
