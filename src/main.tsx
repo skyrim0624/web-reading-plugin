@@ -29,6 +29,8 @@ const PLUGIN_DISPLAY_NAME = "think anytime";
 const PLUGIN_ICON_ID = "think-anytime";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const CODEX_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
+const CODEX_REASONING_OPTIONS = ["low", "medium", "high", "xhigh"] as const;
+const CODEX_RESPONSE_MODE_OPTIONS = ["fast", "balanced", "deep"] as const;
 const MAX_STORED_CONVERSATIONS = 18;
 const MAX_STORED_MESSAGES = 24;
 const MAX_STORED_HIGHLIGHT_ANCHORS = 240;
@@ -66,9 +68,9 @@ interface CodexReadingSettings {
 }
 
 type ReadingSourceType = "markdown" | "pdf" | "epub";
-type CodexResponseMode = "fast" | "deep";
-type CodexReasoningPreset = "fast" | "xhigh";
-type CodexModelReasoningEffort = "low" | "xhigh";
+type CodexResponseMode = (typeof CODEX_RESPONSE_MODE_OPTIONS)[number];
+type CodexReasoningPreset = (typeof CODEX_REASONING_OPTIONS)[number];
+type CodexModelReasoningEffort = CodexReasoningPreset;
 
 interface BuildReadingContextOptions {
   responseMode?: CodexResponseMode;
@@ -234,6 +236,7 @@ interface StoredReadingConversation {
   createdAt: number;
   updatedAt: number;
   model: string;
+  responseMode: CodexResponseMode;
   reasoningPreset: CodexReasoningPreset;
   forceVaultRetrieval: boolean;
   messages: StoredReadingMessage[];
@@ -369,7 +372,7 @@ const DEFAULT_SETTINGS: CodexReadingSettings = {
   nodeCommand: "/Users/andreas/.local/bin/node",
   codexCommand: "/Users/andreas/.bun/bin/codex",
   defaultModel: DEFAULT_CODEX_MODEL,
-  defaultReasoningPreset: "fast",
+  defaultReasoningPreset: "low",
   noteFolder: "AI阅读笔记",
   maxContextChars: 12000,
   contextRadiusLines: 80,
@@ -927,7 +930,7 @@ export default class CodexReadingPlugin extends Plugin {
     const recentFiles = this.settings.includeRecentFiles ? this.getRecentFiles(context.activeFilePath) : [];
     const shouldRetrieve =
       this.settings.enableVaultRetrieval &&
-      (options.forceVaultRetrieval === true || options.responseMode === "deep");
+      (options.forceVaultRetrieval === true || options.responseMode === "balanced" || options.responseMode === "deep");
     const relatedNotes = shouldRetrieve
       ? await this.retrieveRelatedNotes(context, {
           query,
@@ -1932,9 +1935,7 @@ export default class CodexReadingPlugin extends Plugin {
 
   private async handleHighlightNoteClick(event: MouseEvent) {
     const target = event.target instanceof Element ? event.target : null;
-    const marker = target?.closest<HTMLElement>(
-      ".web-highlight-note[data-web-anchor], .web-reading-overlay-highlight[data-web-anchor]",
-    );
+    const marker = findHighlightMarkerFromClickTarget(target);
     if (!marker) return;
 
     event.preventDefault();
@@ -2065,6 +2066,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   const [reasoningPreset, setReasoningPreset] = useState<CodexReasoningPreset>(() =>
     normalizeReasoningPreset(plugin.settings.defaultReasoningPreset),
   );
+  const [responseMode, setResponseMode] = useState<CodexResponseMode>("fast");
   const [forceVaultRetrieval, setForceVaultRetrieval] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [history, setHistory] = useState<StoredReadingConversation[]>(() =>
@@ -2084,13 +2086,14 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           ? trimToLimit(context.selection.text.replace(/\s+/g, " "), 220)
           : "无选区",
         location: formatContextLocation(context),
-        mode: `${reasoningPreset === "xhigh" ? "xH 深度" : "极速"}${forceVaultRetrieval ? " · 查库" : ""}`,
+        mode: `${getResponseModeLabel(responseMode)} · ${getReasoningLabel(reasoningPreset)}${
+          forceVaultRetrieval ? " · 查库" : ""
+        }`,
       };
-  }, [context, forceVaultRetrieval, reasoningPreset]);
+  }, [context, forceVaultRetrieval, reasoningPreset, responseMode]);
 
   const refreshContextQuietly = useCallback(async () => {
     try {
-      const responseMode = buildResponseMode(reasoningPreset, forceVaultRetrieval);
       const nextContext = await plugin.buildReadingContext(undefined, "", {
         responseMode,
         forceVaultRetrieval,
@@ -2099,7 +2102,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     } catch (refreshError) {
       setContext(null);
     }
-  }, [forceVaultRetrieval, plugin, reasoningPreset]);
+  }, [forceVaultRetrieval, plugin, responseMode]);
 
   useEffect(() => {
     void refreshContextQuietly();
@@ -2149,6 +2152,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
         model,
+        responseMode,
         reasoningPreset,
         forceVaultRetrieval,
         messages: storedMessages,
@@ -2159,7 +2163,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     }, 300);
 
     return () => window.clearTimeout(timeout);
-  }, [context, forceVaultRetrieval, messages, model, plugin, reasoningPreset, sessionId]);
+  }, [context, forceVaultRetrieval, messages, model, plugin, reasoningPreset, responseMode, sessionId]);
 
   const askCodex = useCallback(async (overrideQuestion?: string) => {
     const question = (overrideQuestion ?? draft).trim();
@@ -2185,7 +2189,6 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     };
     setMessages((current) => [...current, userMessage, assistantMessage]);
     let markedSelection: MarkedSelectionResult | null = null;
-    const responseMode = buildResponseMode(reasoningPreset, forceVaultRetrieval);
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
@@ -2284,7 +2287,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       }
       setRunning(false);
     }
-  }, [draft, forceVaultRetrieval, messages, model, plugin, reasoningPreset]);
+  }, [draft, forceVaultRetrieval, messages, model, plugin, reasoningPreset, responseMode]);
 
   const stopCurrentAnswer = useCallback(() => {
     abortControllerRef.current?.abort();
@@ -2322,6 +2325,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       })),
     );
     setModel(normalizeCodexModel(conversation.model));
+    setResponseMode(normalizeResponseMode(conversation.responseMode));
     setReasoningPreset(normalizeReasoningPreset(conversation.reasoningPreset));
     setForceVaultRetrieval(conversation.forceVaultRetrieval);
     setLastQuestion(
@@ -2356,7 +2360,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           <div className="codex-reading-tools" aria-label={`${PLUGIN_DISPLAY_NAME} 工具栏`}>
             <select
               aria-label="Codex 模型"
-              className="codex-model-select"
+              className="codex-model-select codex-model-name-select"
               disabled={running}
               onChange={(event) => setModel(normalizeCodexModel(event.currentTarget.value))}
               title="Codex 模型"
@@ -2369,6 +2373,20 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
               ))}
             </select>
             <select
+              aria-label="回答速度"
+              className="codex-model-select codex-speed-select"
+              disabled={running}
+              onChange={(event) => setResponseMode(normalizeResponseMode(event.currentTarget.value))}
+              title="回答速度"
+              value={responseMode}
+            >
+              {CODEX_RESPONSE_MODE_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {getResponseModeLabel(option)}
+                </option>
+              ))}
+            </select>
+            <select
               aria-label="思考强度"
               className="codex-model-select codex-reasoning-select"
               disabled={running}
@@ -2376,8 +2394,11 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
               title="思考强度"
               value={reasoningPreset}
             >
-              <option value="fast">快</option>
-              <option value="xhigh">xH</option>
+              {CODEX_REASONING_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {getReasoningLabel(option)}
+                </option>
+              ))}
             </select>
             <button
               className="codex-icon-button"
@@ -2409,7 +2430,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           <div className="codex-reading-context-line">
             <span>{contextSummary.source}</span>
             <span>{contextSummary.location}</span>
-            <span>{contextSummary.selection === "无选区" ? "未标注" : "已标注"}</span>
+            <span>{contextSummary.selection === "无选区" ? "未选文本" : "已选文本"}</span>
             <span>{contextSummary.mode}</span>
           </div>
         ) : (
@@ -2673,17 +2694,18 @@ class CodexReadingSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("默认思考强度")
-      .setDesc("极速使用 low reasoning；xH 使用 xhigh reasoning，并默认进入深度上下文模式。")
-      .addDropdown((dropdown) =>
+      .setDesc("对应 Codex reasoning，可在右侧阅读面板临时切换。")
+      .addDropdown((dropdown) => {
+        for (const option of CODEX_REASONING_OPTIONS) {
+          dropdown.addOption(option, getReasoningLabel(option));
+        }
         dropdown
-          .addOption("fast", "极速")
-          .addOption("xhigh", "xH")
           .setValue(normalizeReasoningPreset(this.plugin.settings.defaultReasoningPreset))
           .onChange(async (value) => {
             this.plugin.settings.defaultReasoningPreset = normalizeReasoningPreset(value);
             await this.plugin.saveSettings();
-          }),
-      );
+          });
+      });
 
     new Setting(containerEl)
       .setName("阅读笔记目录")
@@ -2883,18 +2905,46 @@ function normalizeCodexModel(value: string | undefined): string {
 }
 
 function normalizeReasoningPreset(value: unknown): CodexReasoningPreset {
-  return value === "xhigh" ? "xhigh" : "fast";
+  if (value === "fast") return "low";
+  return CODEX_REASONING_OPTIONS.includes(value as CodexReasoningPreset)
+    ? (value as CodexReasoningPreset)
+    : "low";
 }
 
 function getModelReasoningEffort(preset: CodexReasoningPreset): CodexModelReasoningEffort {
-  return preset === "xhigh" ? "xhigh" : "low";
+  return normalizeReasoningPreset(preset);
 }
 
-function buildResponseMode(
-  reasoningPreset: CodexReasoningPreset,
-  forceVaultRetrieval: boolean,
-): CodexResponseMode {
-  return reasoningPreset === "xhigh" || forceVaultRetrieval ? "deep" : "fast";
+function normalizeResponseMode(value: unknown): CodexResponseMode {
+  return CODEX_RESPONSE_MODE_OPTIONS.includes(value as CodexResponseMode)
+    ? (value as CodexResponseMode)
+    : "fast";
+}
+
+function getResponseModeLabel(mode: CodexResponseMode): string {
+  if (mode === "deep") return "深度";
+  if (mode === "balanced") return "标准";
+  return "快速";
+}
+
+function getReasoningLabel(preset: CodexReasoningPreset): string {
+  const labels: Record<CodexReasoningPreset, string> = {
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "xHigh",
+  };
+  return labels[preset];
+}
+
+function formatResponseModeInstruction(mode: CodexResponseMode): string {
+  if (mode === "deep") {
+    return "当前是深度模式：可以结合完整阅读上下文、相关笔记、历史问题节点和阅读线索展开，但必须标明依据路径。";
+  }
+  if (mode === "balanced") {
+    return "当前是标准模式：优先回答当前选区，同时可使用少量相关笔记和上下文；不要为了扩展而扩展。";
+  }
+  return "当前是快速模式：优先直接解释当前选区/当前位置，不主动做完整知识网络整理；relatedEchoes、conceptLinks、readingTrails 可以为空。";
 }
 
 function buildPromptContext(
@@ -2902,6 +2952,26 @@ function buildPromptContext(
   responseMode: CodexResponseMode,
 ): Record<string, unknown> {
   if (responseMode === "deep") return context as unknown as Record<string, unknown>;
+  if (responseMode === "balanced") {
+    return {
+      ...context,
+      outline: context.outline.slice(0, 20),
+      backlinks: context.backlinks.slice(0, 12),
+      recentFiles: context.recentFiles.slice(0, 12),
+      relatedNotes: context.relatedNotes.slice(0, 3),
+      surroundingText: trimToLimit(context.surroundingText, 6500),
+      fileExcerpt: trimToLimit(context.fileExcerpt, 9000),
+      agentMemoryExcerpt: context.agentMemoryExcerpt
+        ? trimToLimit(context.agentMemoryExcerpt, 2600)
+        : undefined,
+      selection: context.selection
+        ? {
+            ...context.selection,
+            text: trimToLimit(context.selection.text, 3600),
+          }
+        : undefined,
+    };
+  }
   return {
     ...context,
     outline: context.outline.slice(0, 12),
@@ -2946,6 +3016,7 @@ function normalizeStoredReadingConversations(value: unknown): StoredReadingConve
         createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
         updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
         model: normalizeCodexModel(firstString(record, ["model"])),
+        responseMode: normalizeResponseMode(record.responseMode),
         reasoningPreset: normalizeReasoningPreset(record.reasoningPreset),
         forceVaultRetrieval: record.forceVaultRetrieval === true,
         messages,
@@ -3363,7 +3434,6 @@ function buildCodexPrompt(
   options: AskCodexOptions = {},
 ): string {
   const responseMode = options.responseMode ?? "fast";
-  const isFast = responseMode === "fast";
   const promptContext = buildPromptContext(context, responseMode);
   const historyText = history.length
     ? history
@@ -3383,12 +3453,10 @@ function buildCodexPrompt(
     "4. 不直接要求修改文件，只输出指定 JSON 对象。",
     "5. 回答要适合写入 Obsidian 阅读笔记。",
     "",
-    `回答模式：${isFast ? "极速" : "深度"}`,
-    isFast
-      ? "当前是极速模式：优先直接解释当前选区/当前位置，不主动做完整知识网络整理；relatedEchoes、conceptLinks、readingTrails 可以为空。"
-      : "当前是深度模式：可以结合相关笔记、历史问题节点和阅读线索展开，但必须标明依据路径。",
+    `回答速度/上下文模式：${getResponseModeLabel(responseMode)}`,
+    formatResponseModeInstruction(responseMode),
     `模型：${normalizeCodexModel(options.model ?? DEFAULT_CODEX_MODEL)}`,
-    `思考强度：${normalizeReasoningPreset(options.reasoningPreset ?? "fast")}`,
+    `思考强度：${getReasoningLabel(normalizeReasoningPreset(options.reasoningPreset ?? "low"))}`,
     `查库状态：${context.relatedNotes.length ? `已命中 ${context.relatedNotes.length} 条相关笔记` : "未使用或未命中相关笔记"}`,
     "",
     "硬性约束：",
@@ -3434,7 +3502,7 @@ function buildCodexPrompt(
     "用户问题：",
     question.trim(),
     "",
-    isFast ? "阅读上下文 JSON（极速裁剪）：" : "阅读上下文 JSON：",
+    responseMode === "fast" ? "阅读上下文 JSON（快速裁剪）：" : "阅读上下文 JSON：",
     "```json",
     JSON.stringify(promptContext, null, 2),
     "```",
@@ -4902,6 +4970,40 @@ function getHighlightAnchorFromLeadingText(value: string): string | null {
     value,
   );
   return match?.[1] ?? null;
+}
+
+function findHighlightMarkerFromClickTarget(target: Element | null): HTMLElement | null {
+  const directMarker = target?.closest<HTMLElement>(
+    ".web-highlight-note[data-web-anchor], .web-reading-overlay-highlight[data-web-anchor], .web-reading-text-highlight[data-web-anchor]",
+  );
+  if (directMarker) return directMarker;
+
+  const renderedMark = target?.closest<HTMLElement>("mark");
+  if (!renderedMark) return null;
+  return findAdjacentHighlightMarker(renderedMark);
+}
+
+function findAdjacentHighlightMarker(element: HTMLElement): HTMLElement | null {
+  const marker = findHighlightMarkerInFollowingSiblings(element);
+  if (marker) return marker;
+  return element.parentElement ? findHighlightMarkerInFollowingSiblings(element.parentElement) : null;
+}
+
+function findHighlightMarkerInFollowingSiblings(element: Element): HTMLElement | null {
+  let sibling = element.nextSibling;
+  while (sibling) {
+    if (sibling.nodeType === Node.TEXT_NODE && !sibling.textContent?.trim()) {
+      sibling = sibling.nextSibling;
+      continue;
+    }
+    if (sibling instanceof HTMLElement) {
+      if (sibling.matches(".web-highlight-note[data-web-anchor]")) return sibling;
+      const nestedMarker = sibling.querySelector<HTMLElement>(".web-highlight-note[data-web-anchor]");
+      if (nestedMarker) return nestedMarker;
+    }
+    break;
+  }
+  return null;
 }
 
 function findSelectionRangeInContent(
