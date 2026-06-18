@@ -15,6 +15,7 @@ import {
   TFile,
   TFolder,
   WorkspaceLeaf,
+  addIcon,
   normalizePath,
 } from "obsidian";
 import { spawn } from "child_process";
@@ -24,10 +25,27 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Root, createRoot } from "react-dom/client";
 
 const VIEW_TYPE_CODEX_READING = "web-reading-plugin-view";
+const PLUGIN_DISPLAY_NAME = "think anytime";
+const PLUGIN_ICON_ID = "think-anytime";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const CODEX_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
+const MAX_STORED_CONVERSATIONS = 18;
+const MAX_STORED_MESSAGES = 24;
+const IMMERSIVE_BODY_CLASS = "think-anytime-immersive";
+const IMMERSIVE_EXIT_BUTTON_CLASS = "think-anytime-immersive-exit";
+const THINK_ANYTIME_ICON_SVG = `
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <rect width="128" height="128" rx="18" fill="#050505"/>
+  <path fill="#ffffff" d="M38.2 25.7c9.1-8.9 23-8.3 30.9-1.6 7.9-3 17.8-.8 23.2 6.7 4.8 6.7 4.3 15.7-.5 22.1 5.8 3.8 9.4 10.4 9.4 17.7 0 11.9-9.7 21.5-21.6 21.5-1.8 0-3.5-.2-5.1-.6-3.7 8-11.9 13.3-21.2 13.3-8.6 0-16.1-4.6-20.2-11.4-10.5-.8-18.8-9.6-18.8-20.3 0-6.3 2.9-12.1 7.6-15.8-3.5-11.4 3.6-24.2 16.3-31.6Z"/>
+  <path fill="none" stroke="#050505" stroke-linecap="round" stroke-linejoin="round" stroke-width="7" d="M47 32l4 22-13 7m32-29-8 19 17 6m-33 15 19-2-7 22m-17-1 11-13m21-5 17 11m-26-18 8-15"/>
+</svg>
+`.trim();
 
 interface CodexReadingSettings {
   nodeCommand: string;
   codexCommand: string;
+  defaultModel: string;
+  defaultReasoningPreset: CodexReasoningPreset;
   noteFolder: string;
   maxContextChars: number;
   contextRadiusLines: number;
@@ -45,6 +63,20 @@ interface CodexReadingSettings {
 }
 
 type ReadingSourceType = "markdown" | "pdf" | "epub";
+type CodexResponseMode = "fast" | "deep";
+type CodexReasoningPreset = "fast" | "xhigh";
+type CodexModelReasoningEffort = "low" | "xhigh";
+
+interface BuildReadingContextOptions {
+  responseMode?: CodexResponseMode;
+  forceVaultRetrieval?: boolean;
+}
+
+interface AskCodexOptions extends BuildReadingContextOptions {
+  model?: string;
+  reasoningPreset?: CodexReasoningPreset;
+  abortSignal?: AbortSignal;
+}
 
 interface ReadingSelection {
   text: string;
@@ -172,6 +204,30 @@ interface ChatHistoryItem {
   content: string;
 }
 
+interface StoredReadingMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+interface StoredReadingConversation {
+  id: string;
+  sessionId: string;
+  title: string;
+  sourcePath: string;
+  sourceName?: string;
+  locationLabel?: string;
+  createdAt: number;
+  updatedAt: number;
+  model: string;
+  reasoningPreset: CodexReasoningPreset;
+  forceVaultRetrieval: boolean;
+  messages: StoredReadingMessage[];
+}
+
+interface PluginStoredData extends Partial<CodexReadingSettings> {
+  conversationHistory?: unknown;
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "system";
@@ -270,6 +326,8 @@ interface PdfTextItem {
 const DEFAULT_SETTINGS: CodexReadingSettings = {
   nodeCommand: "/Users/andreas/.local/bin/node",
   codexCommand: "/Users/andreas/.bun/bin/codex",
+  defaultModel: DEFAULT_CODEX_MODEL,
+  defaultReasoningPreset: "fast",
   noteFolder: "AI阅读笔记",
   maxContextChars: 12000,
   contextRadiusLines: 80,
@@ -288,26 +346,31 @@ const DEFAULT_SETTINGS: CodexReadingSettings = {
 
 export default class CodexReadingPlugin extends Plugin {
   settings: CodexReadingSettings = DEFAULT_SETTINGS;
+  private conversationHistory: StoredReadingConversation[] = [];
   private lastMarkedText = "";
   private lastSelectionSnapshot: SelectionSnapshot | null = null;
+  private lastReadingFilePath: string | null = null;
   private highlightPopover: HTMLElement | null = null;
+  private immersiveExitButton: HTMLButtonElement | null = null;
+  private readonly selectionFrameDocuments = new WeakSet<Document>();
   private readonly documentExtractionCache = new Map<string, DocumentExtractionCacheEntry>();
 
   async onload() {
     await this.loadSettings();
+    addIcon(PLUGIN_ICON_ID, THINK_ANYTIME_ICON_SVG);
 
     this.registerView(
       VIEW_TYPE_CODEX_READING,
       (leaf) => new CodexReadingView(leaf, this),
     );
 
-    this.addRibbonIcon("book-open", "打开 Web", () => {
+    this.addRibbonIcon(PLUGIN_ICON_ID, `打开 ${PLUGIN_DISPLAY_NAME}`, () => {
       void this.activateView();
     });
 
     this.addCommand({
       id: "open-web-reading-view",
-      name: "打开 Web 面板",
+      name: `打开 ${PLUGIN_DISPLAY_NAME} 面板`,
       callback: () => {
         void this.activateView();
       },
@@ -327,8 +390,16 @@ export default class CodexReadingPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "toggle-think-anytime-immersive",
+      name: `切换 ${PLUGIN_DISPLAY_NAME} 沉浸式阅读`,
+      callback: () => {
+        this.toggleImmersiveMode();
+      },
+    });
+
+    this.addCommand({
       id: "insert-web-question-callout",
-      name: "插入 Web 问题块",
+      name: `插入 ${PLUGIN_DISPLAY_NAME} 问题块`,
       editorCallback: (editor) => {
         this.insertQuestionCallout(editor);
       },
@@ -336,7 +407,7 @@ export default class CodexReadingPlugin extends Plugin {
 
     this.addCommand({
       id: "answer-current-web-question-callout",
-      name: "回答当前 Web 问题块",
+      name: `回答当前 ${PLUGIN_DISPLAY_NAME} 问题块`,
       editorCallback: (editor, ctx) => {
         void this.answerCurrentQuestionCallout(editor, ctx);
       },
@@ -345,9 +416,34 @@ export default class CodexReadingPlugin extends Plugin {
     this.registerDomEvent(document, "selectionchange", () => {
       this.captureSelectionSnapshot();
     });
+    this.registerDomEvent(document, "mouseup", () => {
+      window.setTimeout(() => this.captureSelectionSnapshot(), 0);
+    });
+    this.registerDomEvent(document, "keyup", () => {
+      window.setTimeout(() => this.captureSelectionSnapshot(), 0);
+    });
     this.registerDomEvent(document, "click", (event) => {
       void this.handleHighlightNoteClick(event);
     });
+    this.registerSelectionListenersInFrames();
+    this.registerInterval(
+      window.setInterval(() => this.registerSelectionListenersInFrames(), 2000),
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        if (file && getReadingSourceType(file)) {
+          this.lastReadingFilePath = file.path;
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", (leaf) => {
+        const file = leaf ? getReadingFileFromLeaf(leaf) : null;
+        if (file) {
+          this.lastReadingFilePath = file.path;
+        }
+      }),
+    );
 
     this.addSettingTab(new CodexReadingSettingTab(this.app, this));
   }
@@ -357,6 +453,7 @@ export default class CodexReadingPlugin extends Plugin {
       leaf.detach();
     }
     this.closeHighlightPopover();
+    this.disableImmersiveMode(false);
   }
 
   async activateView() {
@@ -376,15 +473,86 @@ export default class CodexReadingPlugin extends Plugin {
     this.app.workspace.revealLeaf(leaf);
   }
 
+  toggleImmersiveMode(force?: boolean) {
+    const shouldEnable = force ?? !this.isImmersiveModeEnabled();
+    if (shouldEnable) {
+      this.enableImmersiveMode();
+      return;
+    }
+    this.disableImmersiveMode();
+  }
+
+  isImmersiveModeEnabled() {
+    return document.body.classList.contains(IMMERSIVE_BODY_CLASS);
+  }
+
+  private enableImmersiveMode() {
+    document.body.classList.add(IMMERSIVE_BODY_CLASS);
+    this.ensureImmersiveExitButton();
+    new Notice("已进入沉浸式阅读");
+  }
+
+  private disableImmersiveMode(showNotice = true) {
+    document.body.classList.remove(IMMERSIVE_BODY_CLASS);
+    this.immersiveExitButton?.remove();
+    this.immersiveExitButton = null;
+    if (showNotice) {
+      new Notice("已退出沉浸式阅读");
+    }
+  }
+
+  private ensureImmersiveExitButton() {
+    if (this.immersiveExitButton?.isConnected) return;
+
+    const button = document.createElement("button");
+    button.className = IMMERSIVE_EXIT_BUTTON_CLASS;
+    button.type = "button";
+    button.textContent = "退出沉浸";
+    button.setAttribute("aria-label", `退出 ${PLUGIN_DISPLAY_NAME} 沉浸式阅读`);
+    button.addEventListener("click", () => this.toggleImmersiveMode(false));
+    document.body.appendChild(button);
+    this.immersiveExitButton = button;
+  }
+
   async loadSettings() {
+    const data = ((await this.loadData()) ?? {}) as PluginStoredData;
     this.settings = {
       ...DEFAULT_SETTINGS,
-      ...(await this.loadData()),
+      ...data,
     };
+    this.settings.defaultModel = normalizeCodexModel(this.settings.defaultModel);
+    this.settings.defaultReasoningPreset = normalizeReasoningPreset(
+      this.settings.defaultReasoningPreset,
+    );
+    this.conversationHistory = normalizeStoredReadingConversations(data.conversationHistory);
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.savePluginData();
+  }
+
+  getConversationHistory(): StoredReadingConversation[] {
+    return this.conversationHistory.slice();
+  }
+
+  async upsertConversationSnapshot(conversation: StoredReadingConversation): Promise<void> {
+    this.conversationHistory = upsertStoredReadingConversation(
+      this.conversationHistory,
+      conversation,
+    );
+    await this.savePluginData();
+  }
+
+  async deleteConversationSnapshot(id: string): Promise<void> {
+    this.conversationHistory = this.conversationHistory.filter((conversation) => conversation.id !== id);
+    await this.savePluginData();
+  }
+
+  private async savePluginData(): Promise<void> {
+    await this.saveData({
+      ...this.settings,
+      conversationHistory: this.conversationHistory,
+    });
   }
 
   async buildReadingContext(
@@ -393,9 +561,10 @@ export default class CodexReadingPlugin extends Plugin {
       file: TFile;
     },
     query = "",
+    options: BuildReadingContextOptions = {},
   ): Promise<ExtendedReadingContext> {
     const baseContext = await this.buildBaseReadingContext(source);
-    return this.enrichReadingContext(baseContext, query);
+    return this.enrichReadingContext(baseContext, query, options);
   }
 
   async buildBaseReadingContext(source?: {
@@ -410,7 +579,7 @@ export default class CodexReadingPlugin extends Plugin {
 
     const sourceType = getReadingSourceType(file);
     if (!sourceType) {
-      throw new Error("Web 当前支持 Markdown、PDF 和 EPUB 文件");
+      throw new Error(`${PLUGIN_DISPLAY_NAME} 当前支持 Markdown、PDF 和 EPUB 文件`);
     }
 
     if (sourceType !== "markdown") {
@@ -592,7 +761,11 @@ export default class CodexReadingPlugin extends Plugin {
     return this.markSelectionByTextSearch(file, context);
   }
 
-  async enrichReadingContext(context: ReadingContext, query = ""): Promise<ExtendedReadingContext> {
+  async enrichReadingContext(
+    context: ReadingContext,
+    query = "",
+    options: BuildReadingContextOptions = {},
+  ): Promise<ExtendedReadingContext> {
     const file = this.app.vault.getAbstractFileByPath(context.activeFilePath);
     if (!(file instanceof TFile)) {
       return createEmptyExtendedContext(context);
@@ -604,7 +777,10 @@ export default class CodexReadingPlugin extends Plugin {
     const outlinks = getOutlinks(this.app, file, cache);
     const backlinks = this.settings.includeBacklinks ? getBacklinks(this.app, file) : [];
     const recentFiles = this.settings.includeRecentFiles ? this.getRecentFiles(context.activeFilePath) : [];
-    const relatedNotes = this.settings.enableVaultRetrieval
+    const shouldRetrieve =
+      this.settings.enableVaultRetrieval &&
+      (options.forceVaultRetrieval === true || options.responseMode === "deep");
+    const relatedNotes = shouldRetrieve
       ? await this.retrieveRelatedNotes(context, {
           query,
           currentFile: file,
@@ -688,10 +864,17 @@ export default class CodexReadingPlugin extends Plugin {
     context: ExtendedReadingContext,
     question: string,
     history: ChatHistoryItem[] = [],
+    options: AskCodexOptions = {},
     onToken?: (token: string) => void,
   ): Promise<CodexRunResult> {
-    const prompt = buildCodexPrompt(context, question, this.getCompanionNotePath(context), history);
-    const result = await this.runCodex(prompt, context.vaultPath, onToken);
+    const prompt = buildCodexPrompt(
+      context,
+      question,
+      this.getCompanionNotePath(context),
+      history,
+      options,
+    );
+    const result = await this.runCodex(prompt, context.vaultPath, options, onToken);
     const structuredResponse = parseCodexStructuredResponse(result.answer);
     return {
       ...result,
@@ -727,7 +910,7 @@ export default class CodexReadingPlugin extends Plugin {
       "",
       question.trim(),
       "",
-      "**Web 回答**",
+      `**${PLUGIN_DISPLAY_NAME} 回答**`,
       "",
       answer.trim(),
       "",
@@ -845,7 +1028,7 @@ export default class CodexReadingPlugin extends Plugin {
       const header = [
         "# 问题索引",
         "",
-        "这里自动记录 Web 在阅读中沉淀的问题节点，方便后续跨章节、跨书检索。",
+        `这里自动记录 ${PLUGIN_DISPLAY_NAME} 在阅读中沉淀的问题节点，方便后续跨章节、跨书检索。`,
         "",
       ].join("\n");
       await this.app.vault.create(targetPath, `${header}${entry}\n`);
@@ -885,7 +1068,7 @@ export default class CodexReadingPlugin extends Plugin {
         const header = [
           `# ${title}`,
           "",
-          "这是一条由 Web 自动维护的阅读线索，用来连接不同材料里的相似问题、概念和解释路径。",
+          `这是一条由 ${PLUGIN_DISPLAY_NAME} 自动维护的阅读线索，用来连接不同材料里的相似问题、概念和解释路径。`,
           "",
           "## 问题记录",
           "",
@@ -913,12 +1096,21 @@ export default class CodexReadingPlugin extends Plugin {
   private async runCodex(
     prompt: string,
     vaultPath: string,
+    options: AskCodexOptions = {},
     onToken?: (token: string) => void,
   ): Promise<CodexRunResult> {
     return new Promise((resolve, reject) => {
+      const model = normalizeCodexModel(options.model ?? this.settings.defaultModel);
+      const reasoningEffort = getModelReasoningEffort(
+        normalizeReasoningPreset(options.reasoningPreset ?? this.settings.defaultReasoningPreset),
+      );
       const args = [
         "exec",
         "--json",
+        "--model",
+        model,
+        "--config",
+        `model_reasoning_effort="${reasoningEffort}"`,
         "--cd",
         vaultPath,
         "--sandbox",
@@ -940,10 +1132,30 @@ export default class CodexReadingPlugin extends Plugin {
       let stdoutBuffer = "";
       let stderr = "";
       let settled = false;
+      let aborted = false;
+      const abortHandler = () => {
+        aborted = true;
+        child.kill("SIGTERM");
+      };
+      const cleanupAbortListener = () => {
+        options.abortSignal?.removeEventListener("abort", abortHandler);
+      };
+
+      if (options.abortSignal?.aborted) {
+        child.kill("SIGTERM");
+        reject(new Error("已停止等待当前回答。"));
+        return;
+      }
+      options.abortSignal?.addEventListener("abort", abortHandler, { once: true });
 
       child.on("error", (error) => {
         settled = true;
-        reject(new Error(`无法启动 Codex CLI：${error.message}`));
+        cleanupAbortListener();
+        reject(
+          aborted
+            ? new Error("已停止等待当前回答。")
+            : new Error(`无法启动 Codex CLI：${error.message}`),
+        );
       });
 
       child.stdout.on("data", (chunk: Buffer) => {
@@ -962,6 +1174,11 @@ export default class CodexReadingPlugin extends Plugin {
 
       child.on("close", (code) => {
         if (settled) return;
+        cleanupAbortListener();
+        if (aborted) {
+          reject(new Error("已停止等待当前回答；如果 Codex 稍后返回，本窗口会忽略那次结果。"));
+          return;
+        }
         if (stdoutBuffer.trim()) {
           consumeCodexLine(stdoutBuffer);
         }
@@ -1030,7 +1247,7 @@ export default class CodexReadingPlugin extends Plugin {
       : "在这里写下你的问题。";
     const callout = [
       "",
-      "> [!question]- Web 提问",
+      `> [!question]- ${PLUGIN_DISPLAY_NAME} 提问`,
       ...questionText.split(/\r?\n/).map((line) => `> ${line}`),
       `> ^${blockId}`,
       "",
@@ -1042,7 +1259,7 @@ export default class CodexReadingPlugin extends Plugin {
       line: insertAt.line + 2,
       ch: 2,
     });
-    new Notice("已插入 Web 问题块");
+    new Notice(`已插入 ${PLUGIN_DISPLAY_NAME} 问题块`);
   }
 
   private async answerCurrentQuestionCallout(
@@ -1057,7 +1274,7 @@ export default class CodexReadingPlugin extends Plugin {
 
     const block = findQuestionBlockAtCursor(editor);
     if (!block) {
-      new Notice("请把光标放在 Web 问题块里");
+      new Notice(`请把光标放在 ${PLUGIN_DISPLAY_NAME} 问题块里`);
       return;
     }
 
@@ -1072,20 +1289,29 @@ export default class CodexReadingPlugin extends Plugin {
       workingBlock = insertQuestionBlockId(editor, block, blockId);
     }
 
-    new Notice("Web 正在回答当前问题块...");
+    new Notice(`${PLUGIN_DISPLAY_NAME} 正在回答当前问题块...`);
 
     try {
-      const context = await this.buildReadingContext({ editor, file }, workingBlock.question);
+      const context = await this.buildReadingContext({ editor, file }, workingBlock.question, {
+        responseMode: "deep",
+        forceVaultRetrieval: true,
+      });
       const result = await this.askCodex(
         context,
         [
-          "这是用户在 Obsidian 正文中标注的 Web 问题块。",
+          `这是用户在 Obsidian 正文中标注的 ${PLUGIN_DISPLAY_NAME} 问题块。`,
           "",
           "请回答这个问题，并让回答适合直接写回该问题块下方的折叠回答 callout。",
           "",
           workingBlock.question,
         ].join("\n"),
         [],
+        {
+          model: this.settings.defaultModel,
+          reasoningPreset: "xhigh",
+          responseMode: "deep",
+          forceVaultRetrieval: true,
+        },
       );
 
       const updatedBlock = replaceAnswerCallout(editor, workingBlock, result.answer);
@@ -1100,7 +1326,7 @@ export default class CodexReadingPlugin extends Plugin {
         line: updatedBlock.answerStartLine ?? updatedBlock.endLine,
         ch: 0,
       });
-      new Notice("已写回 Web 回答并记录问题节点");
+      new Notice(`已写回 ${PLUGIN_DISPLAY_NAME} 回答并记录问题节点`);
     } catch (error) {
       new Notice(toErrorMessage(error));
     }
@@ -1116,10 +1342,12 @@ export default class CodexReadingPlugin extends Plugin {
     const useNodeWrapper = Boolean(nodeCommand) && looksLikePath(codexCommand);
     const command = useNodeWrapper ? nodeCommand : codexCommand;
     const spawnArgs = useNodeWrapper ? [codexCommand, ...args] : args;
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: buildChildPath([nodeCommand, codexCommand], process.env.PATH),
     };
+    // NOTE: Obsidian 可能继承旧的 OPENAI_API_KEY，Codex 会优先用它并触发 401；这里改走 Codex 登录态。
+    delete env.OPENAI_API_KEY;
 
     return { command, spawnArgs, env };
   }
@@ -1133,17 +1361,56 @@ export default class CodexReadingPlugin extends Plugin {
     const adapterLike = adapter as { getBasePath?: () => string; basePath?: string };
     const basePath = adapterLike.getBasePath?.() ?? adapterLike.basePath;
     if (!basePath) {
-      throw new Error("无法获取 vault 本地路径；Web 目前只支持桌面端本地 vault");
+      throw new Error(`无法获取 vault 本地路径；${PLUGIN_DISPLAY_NAME} 目前只支持桌面端本地 vault`);
     }
     return basePath;
   }
 
   private getActiveReadingFile(): TFile | null {
     const activeFile = this.app.workspace.getActiveFile();
-    if (activeFile && getReadingSourceType(activeFile)) return activeFile;
+    if (activeFile && getReadingSourceType(activeFile)) {
+      this.lastReadingFilePath = activeFile.path;
+      return activeFile;
+    }
+
+    const activeLeafFile = this.app.workspace.activeLeaf
+      ? getReadingFileFromLeaf(this.app.workspace.activeLeaf)
+      : null;
+    if (activeLeafFile) {
+      this.lastReadingFilePath = activeLeafFile.path;
+      return activeLeafFile;
+    }
+
+    const mostRecentLeaf = this.app.workspace.getMostRecentLeaf();
+    const mostRecentFile = mostRecentLeaf ? getReadingFileFromLeaf(mostRecentLeaf) : null;
+    if (mostRecentFile) {
+      this.lastReadingFilePath = mostRecentFile.path;
+      return mostRecentFile;
+    }
+
+    if (this.lastReadingFilePath) {
+      const lastFile = this.app.vault.getAbstractFileByPath(this.lastReadingFilePath);
+      if (lastFile instanceof TFile && getReadingSourceType(lastFile)) {
+        return lastFile;
+      }
+    }
+
+    const openReadingFiles: TFile[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const file = getReadingFileFromLeaf(leaf);
+      if (file) openReadingFiles.push(file);
+    });
+    const openReadingFile = openReadingFiles[0];
+    if (openReadingFile) {
+      this.lastReadingFilePath = openReadingFile.path;
+      return openReadingFile;
+    }
 
     const markdownView = this.getReadingMarkdownView();
-    if (markdownView?.file && getReadingSourceType(markdownView.file)) return markdownView.file;
+    if (markdownView?.file && getReadingSourceType(markdownView.file)) {
+      this.lastReadingFilePath = markdownView.file.path;
+      return markdownView.file;
+    }
     return null;
   }
 
@@ -1231,6 +1498,28 @@ export default class CodexReadingPlugin extends Plugin {
       .filter((path) => path !== activeFilePath)
       .filter((path) => path.endsWith(".md"))
       .slice(0, 10);
+  }
+
+  private registerSelectionListenersInFrames() {
+    for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
+      let frameDocument: Document | null = null;
+      try {
+        frameDocument = iframe.contentDocument;
+      } catch {
+        continue;
+      }
+      if (!frameDocument || this.selectionFrameDocuments.has(frameDocument)) continue;
+      this.selectionFrameDocuments.add(frameDocument);
+      this.registerDomEvent(frameDocument, "selectionchange", () => {
+        this.captureSelectionSnapshot();
+      });
+      this.registerDomEvent(frameDocument, "mouseup", () => {
+        window.setTimeout(() => this.captureSelectionSnapshot(), 0);
+      });
+      this.registerDomEvent(frameDocument, "keyup", () => {
+        window.setTimeout(() => this.captureSelectionSnapshot(), 0);
+      });
+    }
   }
 
   private captureSelectionSnapshot() {
@@ -1341,7 +1630,7 @@ export default class CodexReadingPlugin extends Plugin {
       "",
       question.trim(),
       "",
-      "**Web 回答**",
+      `**${PLUGIN_DISPLAY_NAME} 回答**`,
       "",
       formatAnswerForReadingNote(result),
       "",
@@ -1358,7 +1647,7 @@ export default class CodexReadingPlugin extends Plugin {
         `来源：${sourceLink}`,
         `位置：${formatMarkedSelectionLocation(anchor, context)}`,
         "",
-        "这个文件由 Web 自动维护，用来保存同一处高亮上的连续问题和讨论。",
+        `这个文件由 ${PLUGIN_DISPLAY_NAME} 自动维护，用来保存同一处高亮上的连续问题和讨论。`,
         "",
       ].join("\n");
       await this.app.vault.create(targetPath, `${header}${entry}`);
@@ -1391,7 +1680,7 @@ export default class CodexReadingPlugin extends Plugin {
     popover.style.top = `${Math.max(16, Math.min(markerRect.top - 12, window.innerHeight - 460))}px`;
 
     const header = popover.createDiv({ cls: "web-highlight-popover-header" });
-    header.createDiv({ cls: "web-highlight-popover-title", text: "Web 高亮批注" });
+    header.createDiv({ cls: "web-highlight-popover-title", text: `${PLUGIN_DISPLAY_NAME} 高亮批注` });
     const closeButton = header.createEl("button", {
       cls: "web-highlight-popover-close",
       text: "×",
@@ -1407,7 +1696,7 @@ export default class CodexReadingPlugin extends Plugin {
     } else {
       body.createDiv({
         cls: "web-highlight-popover-empty",
-        text: "这里还没有保存讨论。发送一次 Web 问题后，这个高亮处会记录问题和回答。",
+        text: `这里还没有保存讨论。发送一次 ${PLUGIN_DISPLAY_NAME} 问题后，这个高亮处会记录问题和回答。`,
       });
     }
 
@@ -1444,11 +1733,11 @@ class CodexReadingView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "Web";
+    return PLUGIN_DISPLAY_NAME;
   }
 
   getIcon(): string {
-    return "book-open";
+    return PLUGIN_ICON_ID;
   }
 
   async onOpen() {
@@ -1470,7 +1759,19 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [context, setContext] = useState<ReadingContext | null>(null);
   const [running, setRunning] = useState(false);
+  const [model, setModel] = useState(() => normalizeCodexModel(plugin.settings.defaultModel));
+  const [reasoningPreset, setReasoningPreset] = useState<CodexReasoningPreset>(() =>
+    normalizeReasoningPreset(plugin.settings.defaultReasoningPreset),
+  );
+  const [forceVaultRetrieval, setForceVaultRetrieval] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<StoredReadingConversation[]>(() =>
+    plugin.getConversationHistory(),
+  );
+  const [sessionId, setSessionId] = useState(() => createReadingSessionId());
+  const [lastQuestion, setLastQuestion] = useState("");
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const contextSummary = useMemo(() => {
     if (!context) return null;
@@ -1481,17 +1782,22 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           ? trimToLimit(context.selection.text.replace(/\s+/g, " "), 220)
           : "无选区",
         location: formatContextLocation(context),
+        mode: `${reasoningPreset === "xhigh" ? "xH 深度" : "极速"}${forceVaultRetrieval ? " · 查库" : ""}`,
       };
-  }, [context]);
+  }, [context, forceVaultRetrieval, reasoningPreset]);
 
   const refreshContextQuietly = useCallback(async () => {
     try {
-      const nextContext = await plugin.buildReadingContext();
+      const responseMode = buildResponseMode(reasoningPreset, forceVaultRetrieval);
+      const nextContext = await plugin.buildReadingContext(undefined, "", {
+        responseMode,
+        forceVaultRetrieval,
+      });
       setContext(nextContext);
     } catch (refreshError) {
       setContext(null);
     }
-  }, [plugin]);
+  }, [forceVaultRetrieval, plugin, reasoningPreset]);
 
   useEffect(() => {
     void refreshContextQuietly();
@@ -1505,14 +1811,63 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
   }, [messages, running]);
 
-  const askCodex = useCallback(async () => {
-    const question = draft.trim();
+  useEffect(() => {
+    return () => abortControllerRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
+    const storedMessages = messages
+      .filter((message): message is ChatMessage & { role: "user" | "assistant" | "system" } => {
+        return (
+          (message.role === "user" || message.role === "assistant" || message.role === "system") &&
+          !message.isStreaming &&
+          Boolean(message.content.trim())
+        );
+      })
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }))
+      .slice(-MAX_STORED_MESSAGES);
+    const firstQuestion = storedMessages.find((message) => message.role === "user")?.content;
+    if (!firstQuestion) return;
+
+    const timeout = window.setTimeout(() => {
+      const now = Date.now();
+      const existing = plugin
+        .getConversationHistory()
+        .find((conversation) => conversation.sessionId === sessionId);
+      const conversation: StoredReadingConversation = {
+        id: existing?.id ?? sessionId,
+        sessionId,
+        title: existing?.title ?? createConversationTitle(firstQuestion),
+        sourcePath: context?.activeFilePath ?? existing?.sourcePath ?? "未知来源",
+        sourceName: context?.activeFileName ?? existing?.sourceName,
+        locationLabel: context ? formatContextLocation(context) : existing?.locationLabel,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        model,
+        reasoningPreset,
+        forceVaultRetrieval,
+        messages: storedMessages,
+      };
+      void plugin.upsertConversationSnapshot(conversation).then(() => {
+        setHistory(plugin.getConversationHistory());
+      });
+    }, 300);
+
+    return () => window.clearTimeout(timeout);
+  }, [context, forceVaultRetrieval, messages, model, plugin, reasoningPreset, sessionId]);
+
+  const askCodex = useCallback(async (overrideQuestion?: string) => {
+    const question = (overrideQuestion ?? draft).trim();
     if (!question) {
       return;
     }
 
     setRunning(true);
     setDraft("");
+    setLastQuestion(question);
 
     const userMessage: ChatMessage = {
       id: createMessageId(),
@@ -1528,9 +1883,15 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     };
     setMessages((current) => [...current, userMessage, assistantMessage]);
     let markedSelection: MarkedSelectionResult | null = null;
+    const responseMode = buildResponseMode(reasoningPreset, forceVaultRetrieval);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
     try {
-      const nextContext = await plugin.buildReadingContext();
+      const nextContext = await plugin.buildReadingContext(undefined, question, {
+        responseMode,
+        forceVaultRetrieval,
+      });
       setContext(nextContext);
       markedSelection = await plugin.markActiveSelection(nextContext);
       setMessages((current) =>
@@ -1549,7 +1910,18 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           content: message.content,
         }));
 
-      const result = await plugin.askCodex(nextContext, question, history);
+      const result = await plugin.askCodex(
+        nextContext,
+        question,
+        history,
+        {
+          model,
+          reasoningPreset,
+          responseMode,
+          forceVaultRetrieval,
+          abortSignal: abortController.signal,
+        },
+      );
       setMessages((current) =>
         current.map((message) =>
           message.id === assistantId
@@ -1605,12 +1977,66 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       );
       new Notice(message);
     } finally {
+      if (abortControllerRef.current === abortController) {
+        abortControllerRef.current = null;
+      }
       setRunning(false);
     }
-  }, [draft, messages, plugin]);
+  }, [draft, forceVaultRetrieval, messages, model, plugin, reasoningPreset]);
+
+  const stopCurrentAnswer = useCallback(() => {
+    abortControllerRef.current?.abort();
+  }, []);
+
+  const retryLastQuestion = useCallback(() => {
+    if (!lastQuestion || running) return;
+    void askCodex(lastQuestion);
+  }, [askCodex, lastQuestion, running]);
+
+  const startNewConversation = useCallback(() => {
+    if (running) {
+      new Notice("当前回答还在进行，先停止或等待完成。");
+      return;
+    }
+    setMessages([]);
+    setDraft("");
+    setLastQuestion("");
+    setSessionId(createReadingSessionId());
+    setHistoryOpen(false);
+    void refreshContextQuietly();
+  }, [refreshContextQuietly, running]);
+
+  const restoreConversation = useCallback((conversation: StoredReadingConversation) => {
+    if (running) {
+      new Notice("当前回答还在进行，先停止或等待完成。");
+      return;
+    }
+    setSessionId(conversation.sessionId);
+    setMessages(
+      conversation.messages.map((message) => ({
+        id: createMessageId(),
+        role: message.role,
+        content: message.content,
+      })),
+    );
+    setModel(normalizeCodexModel(conversation.model));
+    setReasoningPreset(normalizeReasoningPreset(conversation.reasoningPreset));
+    setForceVaultRetrieval(conversation.forceVaultRetrieval);
+    setLastQuestion(
+      conversation.messages.filter((message) => message.role === "user").at(-1)?.content ?? "",
+    );
+    setHistoryOpen(false);
+    void refreshContextQuietly();
+  }, [refreshContextQuietly, running]);
+
+  const deleteConversation = useCallback(async (conversationId: string) => {
+    await plugin.deleteConversationSnapshot(conversationId);
+    setHistory(plugin.getConversationHistory());
+  }, [plugin]);
 
   const onComposerKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (event.nativeEvent.isComposing) return;
       if (event.key !== "Enter" || event.shiftKey) return;
       event.preventDefault();
       if (!running) {
@@ -1623,22 +2049,118 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   return (
     <div className="codex-reading-view">
       <div className="codex-reading-header">
-        <div className="codex-reading-title">Web</div>
+        <div className="codex-reading-topbar">
+          <div className="codex-reading-title">{PLUGIN_DISPLAY_NAME}</div>
+          <div className="codex-reading-tools" aria-label={`${PLUGIN_DISPLAY_NAME} 工具栏`}>
+            <select
+              aria-label="Codex 模型"
+              className="codex-model-select"
+              disabled={running}
+              onChange={(event) => setModel(normalizeCodexModel(event.currentTarget.value))}
+              title="Codex 模型"
+              value={model}
+            >
+              {CODEX_MODEL_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option.replace("gpt-", "")}
+                </option>
+              ))}
+            </select>
+            <select
+              aria-label="思考强度"
+              className="codex-model-select codex-reasoning-select"
+              disabled={running}
+              onChange={(event) => setReasoningPreset(normalizeReasoningPreset(event.currentTarget.value))}
+              title="思考强度"
+              value={reasoningPreset}
+            >
+              <option value="fast">快</option>
+              <option value="xhigh">xH</option>
+            </select>
+            <button
+              className="codex-icon-button"
+              onClick={() => setHistoryOpen((open) => !open)}
+              title="历史"
+              type="button"
+            >
+              历史
+            </button>
+            <button
+              className="codex-icon-button"
+              onClick={() => plugin.toggleImmersiveMode()}
+              title="沉浸式阅读"
+              type="button"
+            >
+              沉浸
+            </button>
+            <button
+              className="codex-icon-button"
+              onClick={startNewConversation}
+              title="新对话"
+              type="button"
+            >
+              新
+            </button>
+          </div>
+        </div>
         {contextSummary ? (
           <div className="codex-reading-context-line">
             <span>{contextSummary.source}</span>
             <span>{contextSummary.location}</span>
             <span>{contextSummary.selection === "无选区" ? "未标注" : "已标注"}</span>
+            <span>{contextSummary.mode}</span>
           </div>
         ) : (
           <div className="codex-reading-context-line">打开 Markdown、PDF 或 EPUB 后即可提问</div>
         )}
+        {historyOpen ? (
+          <div className="codex-history-panel">
+            {history.length ? (
+              history.map((conversation) => (
+                <div
+                  className={`codex-history-item${
+                    conversation.sessionId === sessionId ? " codex-history-item-active" : ""
+                  }`}
+                  key={conversation.id}
+                >
+                  <button
+                    className="codex-history-open"
+                    onClick={() => restoreConversation(conversation)}
+                    type="button"
+                  >
+                    <span className="codex-history-title">{conversation.title}</span>
+                    <span className="codex-history-meta">
+                      {formatHistoryTimestamp(conversation.updatedAt)}
+                      {conversation.sourceName ? ` · ${conversation.sourceName}` : ""}
+                    </span>
+                    <span className="codex-history-snippet">
+                      {trimToLimit(
+                        conversation.messages.at(-1)?.content.replace(/\s+/g, " ") ?? "",
+                        88,
+                      )}
+                    </span>
+                  </button>
+                  <button
+                    aria-label="删除历史对话"
+                    className="codex-history-delete"
+                    onClick={() => void deleteConversation(conversation.id)}
+                    type="button"
+                  >
+                    删除
+                  </button>
+                </div>
+              ))
+            ) : (
+              <div className="codex-history-empty">还没有可恢复的对话。</div>
+            )}
+          </div>
+        ) : null}
       </div>
 
       <div className="codex-chat-list">
         {messages.length === 0 ? (
           <div className="codex-chat-empty">
-            <div className="codex-chat-empty-mark">Web</div>
+            <div className="codex-chat-empty-mark">{PLUGIN_DISPLAY_NAME}</div>
             <div className="codex-chat-empty-title">等待你的阅读问题</div>
           </div>
         ) : null}
@@ -1648,13 +2170,13 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
             key={message.id}
           >
             <div className="codex-chat-message-label">
-              {message.role === "user" ? "你" : message.role === "assistant" ? "Web" : "系统"}
+              {message.role === "user" ? "你" : message.role === "assistant" ? PLUGIN_DISPLAY_NAME : "系统"}
             </div>
             <div className="codex-chat-message-content">
               {message.structuredResponse ? (
                 <StructuredAnswer response={message.structuredResponse} />
               ) : (
-                message.content || (message.isStreaming ? "Web 正在阅读..." : "")
+                message.content || (message.isStreaming ? `${PLUGIN_DISPLAY_NAME} 正在阅读...` : "")
               )}
             </div>
             {message.context?.selection?.text ? (
@@ -1679,6 +2201,32 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
       </div>
 
       <div className="codex-chat-composer">
+        <div className="codex-composer-tools">
+          <button
+            className={`codex-tool-button${forceVaultRetrieval ? " codex-tool-button-active" : ""}`}
+            disabled={running}
+            onClick={() => setForceVaultRetrieval((value) => !value)}
+            type="button"
+          >
+            查库
+          </button>
+          <button
+            className="codex-tool-button"
+            disabled={running || !lastQuestion}
+            onClick={retryLastQuestion}
+            type="button"
+          >
+            重试
+          </button>
+          <button
+            className="codex-tool-button"
+            disabled={!running}
+            onClick={stopCurrentAnswer}
+            type="button"
+          >
+            停止
+          </button>
+        </div>
         <textarea
           className="codex-chat-input"
           disabled={running}
@@ -1688,11 +2236,11 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           value={draft}
         />
         <button
-          aria-label={running ? "Web 正在阅读" : "发送给 Web"}
+          aria-label={running ? `${PLUGIN_DISPLAY_NAME} 正在阅读` : `发送给 ${PLUGIN_DISPLAY_NAME}`}
           className="mod-cta codex-chat-send"
           disabled={running || !draft.trim()}
-          onClick={askCodex}
-          title={running ? "Web 正在阅读" : "发送"}
+          onClick={() => void askCodex()}
+          title={running ? `${PLUGIN_DISPLAY_NAME} 正在阅读` : "发送"}
         >
           <span aria-hidden="true" className="codex-chat-send-icon">
             {running ? "..." : "↑"}
@@ -1767,7 +2315,7 @@ class CodexReadingSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Web 设置" });
+    containerEl.createEl("h2", { text: `${PLUGIN_DISPLAY_NAME} 设置` });
 
     new Setting(containerEl)
       .setName("Node 命令")
@@ -1791,13 +2339,42 @@ class CodexReadingSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.codexCommand)
           .onChange(async (value) => {
             this.plugin.settings.codexCommand = value.trim() || DEFAULT_SETTINGS.codexCommand;
+              await this.plugin.saveSettings();
+            }),
+      );
+
+    new Setting(containerEl)
+      .setName("默认 Codex 模型")
+      .setDesc("右侧阅读面板默认使用的模型；可在面板顶部临时切换。")
+      .addDropdown((dropdown) => {
+        for (const model of CODEX_MODEL_OPTIONS) {
+          dropdown.addOption(model, model.replace("gpt-", ""));
+        }
+        dropdown
+          .setValue(normalizeCodexModel(this.plugin.settings.defaultModel))
+          .onChange(async (value) => {
+            this.plugin.settings.defaultModel = normalizeCodexModel(value);
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("默认思考强度")
+      .setDesc("极速使用 low reasoning；xH 使用 xhigh reasoning，并默认进入深度上下文模式。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("fast", "极速")
+          .addOption("xhigh", "xH")
+          .setValue(normalizeReasoningPreset(this.plugin.settings.defaultReasoningPreset))
+          .onChange(async (value) => {
+            this.plugin.settings.defaultReasoningPreset = normalizeReasoningPreset(value);
             await this.plugin.saveSettings();
           }),
       );
 
     new Setting(containerEl)
       .setName("阅读笔记目录")
-      .setDesc("Web 回答会追加到这个目录下的 companion note。")
+      .setDesc(`${PLUGIN_DISPLAY_NAME} 回答会追加到这个目录下的 companion note。`)
       .addText((text) =>
         text
           .setPlaceholder("AI阅读笔记")
@@ -1984,6 +2561,123 @@ function createEmptyExtendedContext(context: ReadingContext): ExtendedReadingCon
     relatedNotes: [],
     availableActions: [],
   };
+}
+
+function normalizeCodexModel(value: string | undefined): string {
+  const model = value?.trim();
+  if (!model) return DEFAULT_CODEX_MODEL;
+  return model;
+}
+
+function normalizeReasoningPreset(value: unknown): CodexReasoningPreset {
+  return value === "xhigh" ? "xhigh" : "fast";
+}
+
+function getModelReasoningEffort(preset: CodexReasoningPreset): CodexModelReasoningEffort {
+  return preset === "xhigh" ? "xhigh" : "low";
+}
+
+function buildResponseMode(
+  reasoningPreset: CodexReasoningPreset,
+  forceVaultRetrieval: boolean,
+): CodexResponseMode {
+  return reasoningPreset === "xhigh" || forceVaultRetrieval ? "deep" : "fast";
+}
+
+function buildPromptContext(
+  context: ExtendedReadingContext,
+  responseMode: CodexResponseMode,
+): Record<string, unknown> {
+  if (responseMode === "deep") return context as unknown as Record<string, unknown>;
+  return {
+    ...context,
+    outline: context.outline.slice(0, 12),
+    backlinks: context.backlinks.slice(0, 8),
+    recentFiles: context.recentFiles.slice(0, 8),
+    relatedNotes: [],
+    surroundingText: trimToLimit(context.surroundingText, 3600),
+    fileExcerpt: trimToLimit(context.fileExcerpt, 5200),
+    agentMemoryExcerpt: context.agentMemoryExcerpt
+      ? trimToLimit(context.agentMemoryExcerpt, 1800)
+      : undefined,
+    selection: context.selection
+      ? {
+          ...context.selection,
+          text: trimToLimit(context.selection.text, 2600),
+        }
+      : undefined,
+  };
+}
+
+function normalizeStoredReadingConversations(value: unknown): StoredReadingConversation[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): StoredReadingConversation | null => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const id = firstString(record, ["id"]);
+      const sessionId = firstString(record, ["sessionId", "session_id"]) || id;
+      const title = firstString(record, ["title"]);
+      if (!id || !sessionId || !title) return null;
+      const messages = normalizeStoredReadingMessages(record.messages);
+      if (!messages.length) return null;
+      const createdAt = Number(record.createdAt);
+      const updatedAt = Number(record.updatedAt);
+      return {
+        id,
+        sessionId,
+        title,
+        sourcePath: firstString(record, ["sourcePath", "source"]) || "未知来源",
+        sourceName: firstString(record, ["sourceName"]),
+        locationLabel: firstString(record, ["locationLabel"]),
+        createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+        updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
+        model: normalizeCodexModel(firstString(record, ["model"])),
+        reasoningPreset: normalizeReasoningPreset(record.reasoningPreset),
+        forceVaultRetrieval: record.forceVaultRetrieval === true,
+        messages,
+      };
+    })
+    .filter((item): item is StoredReadingConversation => item !== null)
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, MAX_STORED_CONVERSATIONS);
+}
+
+function normalizeStoredReadingMessages(value: unknown): StoredReadingMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): StoredReadingMessage | null => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const role = record.role;
+      if (role !== "user" && role !== "assistant" && role !== "system") return null;
+      const content = firstString(record, ["content"]);
+      if (!content.trim()) return null;
+      return {
+        role,
+        content,
+      };
+    })
+    .filter((item): item is StoredReadingMessage => item !== null)
+    .slice(-MAX_STORED_MESSAGES);
+}
+
+function upsertStoredReadingConversation(
+  conversations: StoredReadingConversation[],
+  conversation: StoredReadingConversation,
+): StoredReadingConversation[] {
+  const existing = conversations.find((item) => item.sessionId === conversation.sessionId);
+  const nextConversation = existing
+    ? {
+        ...conversation,
+        id: existing.id,
+        createdAt: existing.createdAt,
+        title: existing.title || conversation.title,
+      }
+    : conversation;
+  return [nextConversation, ...conversations.filter((item) => item.sessionId !== conversation.sessionId)]
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, MAX_STORED_CONVERSATIONS);
 }
 
 function normalizeFrontmatter(
@@ -2286,15 +2980,19 @@ function buildCodexPrompt(
   question: string,
   companionNotePath: string,
   history: ChatHistoryItem[] = [],
+  options: AskCodexOptions = {},
 ): string {
+  const responseMode = options.responseMode ?? "fast";
+  const isFast = responseMode === "fast";
+  const promptContext = buildPromptContext(context, responseMode);
   const historyText = history.length
     ? history
-        .map((message) => `${message.role === "user" ? "用户" : "Web"}：${message.content}`)
+        .map((message) => `${message.role === "user" ? "用户" : PLUGIN_DISPLAY_NAME}：${message.content}`)
         .join("\n\n")
     : "无";
 
   return [
-    "你是一个嵌入 Obsidian 的 Web 阅读 agent。Web 的目标是把用户阅读中的问题、回答、旧笔记和跨书关联织成一张知识网。底层运行时是 Codex CLI harness。",
+    `你是一个嵌入 Obsidian 的 ${PLUGIN_DISPLAY_NAME} 阅读 agent。${PLUGIN_DISPLAY_NAME} 的目标是把用户阅读中的问题、回答、旧笔记和跨书关联织成一张知识网。底层运行时是 Codex CLI harness。`,
     "",
     "目标：帮助用户理解正在阅读的材料，解释难点，提炼概念，连接上下文，并给出可写入阅读笔记和问题节点的回答。",
     "",
@@ -2304,6 +3002,14 @@ function buildCodexPrompt(
     "3. 如果是推测，明确标注“这是推测”。",
     "4. 不直接要求修改文件，只输出指定 JSON 对象。",
     "5. 回答要适合写入 Obsidian 阅读笔记。",
+    "",
+    `回答模式：${isFast ? "极速" : "深度"}`,
+    isFast
+      ? "当前是极速模式：优先直接解释当前选区/当前位置，不主动做完整知识网络整理；relatedEchoes、conceptLinks、readingTrails 可以为空。"
+      : "当前是深度模式：可以结合相关笔记、历史问题节点和阅读线索展开，但必须标明依据路径。",
+    `模型：${normalizeCodexModel(options.model ?? DEFAULT_CODEX_MODEL)}`,
+    `思考强度：${normalizeReasoningPreset(options.reasoningPreset ?? "fast")}`,
+    `查库状态：${context.relatedNotes.length ? `已命中 ${context.relatedNotes.length} 条相关笔记` : "未使用或未命中相关笔记"}`,
     "",
     "硬性约束：",
     "- 使用简体中文。",
@@ -2348,9 +3054,9 @@ function buildCodexPrompt(
     "用户问题：",
     question.trim(),
     "",
-    "阅读上下文 JSON：",
+    isFast ? "阅读上下文 JSON（极速裁剪）：" : "阅读上下文 JSON：",
     "```json",
-    JSON.stringify(context, null, 2),
+    JSON.stringify(promptContext, null, 2),
     "```",
   ].join("\n");
 }
@@ -2733,6 +3439,15 @@ function getReadingSourceType(file: TFile): ReadingSourceType | null {
   if (extension === "md") return "markdown";
   if (extension === "pdf") return "pdf";
   if (extension === "epub") return "epub";
+  return null;
+}
+
+function getReadingFileFromLeaf(leaf: WorkspaceLeaf): TFile | null {
+  const viewWithFile = leaf.view as { file?: unknown };
+  const file = viewWithFile.file;
+  if (file instanceof TFile && getReadingSourceType(file)) {
+    return file;
+  }
   return null;
 }
 
@@ -3340,9 +4055,9 @@ function replaceAnswerCallout(
 }
 
 function formatAnswerCallout(answer: string): string {
-  const body = answer.trim() || "Web 没有返回内容。";
+  const body = answer.trim() || `${PLUGIN_DISPLAY_NAME} 没有返回内容。`;
   return [
-    "> [!answer]- Web 回答",
+    `> [!answer]- ${PLUGIN_DISPLAY_NAME} 回答`,
     ...body.split(/\r?\n/).map((line) => `> ${line}`),
     "",
   ].join("\n");
@@ -3386,11 +4101,11 @@ function findQuestionBlockId(lines: string[]): string | null {
 }
 
 function isQuestionCalloutHeader(line: string): boolean {
-  return /^>\s*\[!question\][+-]?\s*(?:(?:Codex|Web)\s*提问)?/i.test(line.trim());
+  return /^>\s*\[!question\][+-]?\s*(?:(?:Codex|Web|think\s+anytime)\s*提问)?/i.test(line.trim());
 }
 
 function isAnswerCalloutHeader(line: string): boolean {
-  return /^>\s*\[!answer\][+-]?\s*(?:(?:Codex|Web)\s*回答)?/i.test(line.trim());
+  return /^>\s*\[!answer\][+-]?\s*(?:(?:Codex|Web|think\s+anytime)\s*回答)?/i.test(line.trim());
 }
 
 function isAnyCalloutHeader(line: string): boolean {
@@ -3422,6 +4137,25 @@ function createMessageId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createReadingSessionId(): string {
+  return `ob-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createConversationTitle(question: string): string {
+  return trimToLimit(question.replace(/\s+/g, " ").trim(), 42) || "新对话";
+}
+
+function formatHistoryTimestamp(value: number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function createHighlightAnchorId(): string {
   const stamp = new Date()
     .toISOString()
@@ -3432,7 +4166,7 @@ function createHighlightAnchorId(): string {
 }
 
 function formatHighlightAnchorMarkup(anchorId: string): string {
-  return `<span class="web-highlight-note" data-web-anchor="${anchorId}" title="展开 Web 讨论">✎</span>`;
+  return `<span class="web-highlight-note" data-web-anchor="${anchorId}" title="展开 ${PLUGIN_DISPLAY_NAME} 讨论">✎</span>`;
 }
 
 function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
@@ -3446,7 +4180,13 @@ function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
   }
 
   for (const targetWindow of windows) {
-    const selection = targetWindow.getSelection?.();
+    let selection: Selection | null | undefined;
+    try {
+      selection = targetWindow.getSelection?.();
+    } catch {
+      // 跨域 iframe 不能读取选区，直接跳过。
+      continue;
+    }
     const selectedText = selection?.toString().trim() ?? "";
     if (selectedText.length <= 1) continue;
 
