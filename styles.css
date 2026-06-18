@@ -46,8 +46,71 @@ body.think-anytime-immersive .workspace-leaf-content {
   border-radius: 0 !important;
 }
 
+body.think-anytime-immersive .workspace-leaf-content {
+  overflow: hidden !important;
+  position: relative !important;
+}
+
+body.think-anytime-immersive .workspace-leaf-content > .view-header {
+  backdrop-filter: blur(18px) saturate(1.2);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+  left: 0;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute !important;
+  right: 0;
+  top: 0;
+  transform: translateY(-112%);
+  transition: opacity 150ms ease, transform 150ms ease;
+  z-index: 80;
+}
+
+body.think-anytime-immersive.think-anytime-top-ui-visible .workspace-leaf-content > .view-header {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+body.think-anytime-immersive .workspace-leaf-content > .view-content {
+  height: 100% !important;
+  min-height: 0 !important;
+}
+
 body.think-anytime-immersive .workspace-split.mod-root,
 body.think-anytime-immersive .workspace-tabs.mod-root {
+  padding-top: 0 !important;
+}
+
+body.think-anytime-immersive .pdf-toolbar,
+body.think-anytime-immersive .pdf-toolbar-container,
+body.think-anytime-immersive .pdf-controls,
+body.think-anytime-immersive .pdf-header {
+  backdrop-filter: blur(18px) saturate(1.2);
+  left: 0;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  position: absolute !important;
+  right: 0;
+  top: 0;
+  transform: translateY(-112%) !important;
+  transition: opacity 150ms ease, transform 150ms ease;
+  z-index: 90;
+}
+
+body.think-anytime-immersive.think-anytime-top-ui-visible .pdf-toolbar,
+body.think-anytime-immersive.think-anytime-top-ui-visible .pdf-toolbar-container,
+body.think-anytime-immersive.think-anytime-top-ui-visible .pdf-controls,
+body.think-anytime-immersive.think-anytime-top-ui-visible .pdf-header {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: translateY(0) !important;
+}
+
+body.think-anytime-immersive .pdf-container,
+body.think-anytime-immersive .pdf-viewer-container,
+body.think-anytime-immersive .pdf-viewer {
+  height: 100% !important;
+  margin-top: 0 !important;
   padding-top: 0 !important;
 }
 

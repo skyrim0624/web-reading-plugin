@@ -34,6 +34,7 @@ const MAX_STORED_MESSAGES = 24;
 const MAX_STORED_HIGHLIGHT_ANCHORS = 240;
 const MAX_STORED_HIGHLIGHT_CONVERSATIONS = 36;
 const IMMERSIVE_BODY_CLASS = "think-anytime-immersive";
+const IMMERSIVE_TOP_UI_VISIBLE_CLASS = "think-anytime-top-ui-visible";
 const IMMERSIVE_EXIT_BUTTON_CLASS = "think-anytime-immersive-exit";
 const THINK_ANYTIME_ICON_SVG = `
 <svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -467,6 +468,9 @@ export default class CodexReadingPlugin extends Plugin {
     this.registerDomEvent(document, "click", (event) => {
       void this.handleHighlightNoteClick(event);
     });
+    this.registerDomEvent(document, "mousemove", (event) => {
+      this.updateImmersiveTopUiVisibility(event);
+    });
     this.registerSelectionListenersInFrames();
     this.registerInterval(
       window.setInterval(() => this.registerSelectionListenersInFrames(), 2000),
@@ -531,16 +535,31 @@ export default class CodexReadingPlugin extends Plugin {
 
   private enableImmersiveMode() {
     document.body.classList.add(IMMERSIVE_BODY_CLASS);
+    document.body.classList.remove(IMMERSIVE_TOP_UI_VISIBLE_CLASS);
     this.ensureImmersiveExitButton();
     new Notice("已进入沉浸式阅读");
   }
 
   private disableImmersiveMode(showNotice = true) {
     document.body.classList.remove(IMMERSIVE_BODY_CLASS);
+    document.body.classList.remove(IMMERSIVE_TOP_UI_VISIBLE_CLASS);
     this.immersiveExitButton?.remove();
     this.immersiveExitButton = null;
     if (showNotice) {
       new Notice("已退出沉浸式阅读");
+    }
+  }
+
+  private updateImmersiveTopUiVisibility(event: MouseEvent) {
+    if (!this.isImmersiveModeEnabled()) return;
+
+    if (event.clientY <= 72) {
+      document.body.classList.add(IMMERSIVE_TOP_UI_VISIBLE_CLASS);
+      return;
+    }
+
+    if (event.clientY >= 150) {
+      document.body.classList.remove(IMMERSIVE_TOP_UI_VISIBLE_CLASS);
     }
   }
 
