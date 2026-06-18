@@ -99,6 +99,7 @@ interface SelectionSnapshot {
   locationLabel?: string;
   pageNumber?: number;
   rects?: SelectionRect[];
+  contextText?: string;
   capturedAt: number;
 }
 
@@ -316,6 +317,7 @@ interface DomSelectionSnapshot {
   locationLabel?: string;
   pageNumber?: number;
   rects?: SelectionRect[];
+  contextText?: string;
 }
 
 interface TextExtractorApi {
@@ -707,11 +709,18 @@ export default class CodexReadingPlugin extends Plugin {
     file: TFile,
     sourceType: Exclude<ReadingSourceType, "markdown">,
   ): Promise<ReadingContext> {
-    const document = await this.getExtractedReadingDocument(file, sourceType);
     const selectionSnapshot = this.getUsableSelectionSnapshot(file.path);
     const domSelection = getCurrentDomSelectionSnapshot();
     const selectedText = domSelection?.text || selectionSnapshot?.text || "";
     const preferredPageNumber = domSelection?.pageNumber ?? selectionSnapshot?.pageNumber;
+    const domContextText = domSelection?.contextText ?? selectionSnapshot?.contextText ?? "";
+    const document = await this.getExtractedReadingDocumentOrDomFallback(
+      file,
+      sourceType,
+      domContextText,
+      selectedText,
+      preferredPageNumber,
+    );
     const locatedSelection = selectedText
       ? locateSelectionInExtractedDocument(document, selectedText, preferredPageNumber)
       : null;
@@ -761,6 +770,49 @@ export default class CodexReadingPlugin extends Plugin {
       agentMemoryExcerpt: undefined,
       capturedAt: new Date().toISOString(),
     };
+  }
+
+  private async getExtractedReadingDocumentOrDomFallback(
+    file: TFile,
+    sourceType: Exclude<ReadingSourceType, "markdown">,
+    domContextText: string,
+    selectedText: string,
+    pageNumber?: number,
+  ): Promise<ExtractedReadingDocument> {
+    const fallbackText = normalizeExtractedText(
+      domContextText || selectedText || "当前 PDF/EPUB 没有抽取到可用全文。请先在正文里选中一段文字再提问。",
+    );
+
+    if (domContextText.trim() || selectedText.trim()) {
+      return buildExtractedReadingDocument(sourceType, [
+        {
+          heading: pageNumber ? `第 ${pageNumber} 页` : "当前阅读位置",
+          text: fallbackText,
+          locationLabel: pageNumber ? `第 ${pageNumber} 页上下文` : "当前选区上下文",
+          pageNumber,
+          outlineLevel: 1,
+        },
+      ]);
+    }
+
+    try {
+      return await this.getExtractedReadingDocument(file, sourceType);
+    } catch {
+      const fallbackDocument = buildExtractedReadingDocument(sourceType, [
+        {
+          heading: pageNumber ? `第 ${pageNumber} 页` : "当前阅读位置",
+          text: fallbackText,
+          locationLabel: pageNumber ? `第 ${pageNumber} 页上下文` : "当前选区上下文",
+          pageNumber,
+          outlineLevel: 1,
+        },
+      ]);
+      this.documentExtractionCache.set(file.path, {
+        key: `${file.stat.mtime}:${file.stat.size}`,
+        document: fallbackDocument,
+      });
+      return fallbackDocument;
+    }
   }
 
   private async getExtractedReadingDocument(
@@ -1639,6 +1691,7 @@ export default class CodexReadingPlugin extends Plugin {
       locationLabel: domSelection.locationLabel,
       pageNumber: domSelection.pageNumber,
       rects: domSelection.rects,
+      contextText: domSelection.contextText,
       capturedAt: Date.now(),
     };
 
@@ -2052,7 +2105,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
     void refreshContextQuietly();
     const interval = window.setInterval(() => {
       void refreshContextQuietly();
-    }, 2500);
+    }, 700);
     return () => window.clearInterval(interval);
   }, [refreshContextQuietly]);
 
@@ -2362,6 +2415,17 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
         ) : (
           <div className="codex-reading-context-line">打开 Markdown、PDF 或 EPUB 后即可提问</div>
         )}
+        {context?.selection?.text ? (
+          <div className="codex-selection-preview">
+            <div className="codex-selection-preview-title">
+              <span>{context.activeFileBasename}</span>
+              <span>已选文本（{context.selection.text.length} 字）</span>
+            </div>
+            <div className="codex-selection-preview-text">
+              {trimToLimit(context.selection.text.replace(/\s+/g, " "), 180)}
+            </div>
+          </div>
+        ) : null}
         {historyOpen ? (
           <div className="codex-history-panel">
             {history.length ? (
@@ -4620,18 +4684,74 @@ function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
 
     const anchorElement = getSelectionAnchorElement(selection);
     if (anchorElement?.closest(".codex-reading-root")) continue;
-    const pageElement = anchorElement?.closest<HTMLElement>("[data-page-number]");
+    const pageElement = anchorElement?.closest<HTMLElement>("[data-page-number]") ?? null;
     const pageNumber = parseOptionalPositiveInteger(pageElement?.dataset.pageNumber);
     const rects = getSelectionRects(selection, offsetLeft, offsetTop, pageNumber);
+    const contextText = getSelectionContextText(targetWindow.document, anchorElement, pageElement, selectedText);
     return {
       text: selectedText,
       pageNumber,
       locationLabel: pageNumber ? `第 ${pageNumber} 页` : undefined,
       rects,
+      contextText,
     };
   }
 
   return null;
+}
+
+function getSelectionContextText(
+  ownerDocument: Document,
+  anchorElement: Element | null,
+  pageElement: HTMLElement | null,
+  selectedText: string,
+): string {
+  const pageText = normalizeDomReadingText(pageElement?.textContent ?? "");
+  if (pageText.length >= selectedText.length + 20) return pageText;
+
+  const textLayer = anchorElement?.closest<HTMLElement>(".textLayer, .text-layer, [class*='textLayer']");
+  const textLayerText = normalizeDomReadingText(textLayer?.textContent ?? "");
+  if (textLayerText.length >= selectedText.length + 20) return textLayerText;
+
+  const visiblePageText = collectVisiblePageText(ownerDocument, pageElement);
+  if (visiblePageText.length >= selectedText.length + 20) return visiblePageText;
+
+  return selectedText;
+}
+
+function collectVisiblePageText(ownerDocument: Document, currentPage: HTMLElement | null): string {
+  const pages = Array.from(ownerDocument.querySelectorAll<HTMLElement>("[data-page-number]"));
+  if (!pages.length) return "";
+
+  const currentPageNumber = parseOptionalPositiveInteger(currentPage?.dataset.pageNumber);
+  const candidates = currentPageNumber
+    ? pages.filter((page) => {
+        const pageNumber = parseOptionalPositiveInteger(page.dataset.pageNumber);
+        return pageNumber !== undefined && Math.abs(pageNumber - currentPageNumber) <= 1;
+      })
+    : pages.filter(isElementInViewport).slice(0, 3);
+
+  return normalizeDomReadingText(
+    candidates
+      .map((page) => page.textContent ?? "")
+      .filter(Boolean)
+      .join("\n\n"),
+  );
+}
+
+function isElementInViewport(element: HTMLElement): boolean {
+  const rect = element.getBoundingClientRect();
+  return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+}
+
+function normalizeDomReadingText(value: string): string {
+  return value
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, "\n")
+    .replace(/([\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function getSelectionRects(

@@ -268,6 +268,40 @@ body.think-anytime-immersive .pdf-viewer {
   white-space: nowrap;
 }
 
+.codex-selection-preview {
+  background: color-mix(in srgb, var(--interactive-accent), transparent 92%);
+  border: 1px solid color-mix(in srgb, var(--interactive-accent), transparent 64%);
+  border-radius: 14px;
+  color: var(--text-normal);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.codex-selection-preview-title {
+  align-items: center;
+  color: color-mix(in srgb, var(--interactive-accent), var(--text-normal) 28%);
+  display: flex;
+  font-size: 12px;
+  font-weight: 760;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.codex-selection-preview-title span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-selection-preview-text {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .codex-history-panel {
   background: color-mix(in srgb, var(--background-primary), var(--background-secondary) 18%);
   border: 1px solid color-mix(in srgb, var(--background-modifier-border), transparent 32%);
