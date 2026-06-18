@@ -604,6 +604,35 @@ body.think-anytime-immersive .workspace-tabs.mod-root {
   border-color: color-mix(in srgb, var(--interactive-accent), transparent 28%);
 }
 
+.web-reading-overlay-layer {
+  inset: 0;
+  pointer-events: none;
+  position: fixed;
+  z-index: 9990;
+}
+
+.web-reading-overlay-highlight {
+  background: color-mix(in srgb, #ffd84d, transparent 48%);
+  border: 0;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, #c99700, transparent 52%);
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+  pointer-events: auto;
+  position: fixed;
+}
+
+.web-reading-overlay-highlight:hover {
+  background: color-mix(in srgb, #ffd84d, transparent 34%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, #a77a00, transparent 32%);
+}
+
+.web-reading-overlay-highlight:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
 .web-highlight-popover {
   backdrop-filter: blur(18px) saturate(1.25);
   background: color-mix(in srgb, var(--background-primary), transparent 4%);

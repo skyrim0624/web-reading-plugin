@@ -85,6 +85,7 @@ interface ReadingSelection {
   locationLabel?: string;
   pageNumber?: number;
   chapterTitle?: string;
+  rects?: SelectionRect[];
 }
 
 interface SelectionSnapshot {
@@ -94,6 +95,7 @@ interface SelectionSnapshot {
   to?: EditorPosition;
   locationLabel?: string;
   pageNumber?: number;
+  rects?: SelectionRect[];
   capturedAt: number;
 }
 
@@ -103,6 +105,15 @@ interface MarkedSelectionResult {
   startLine: number;
   endLine: number;
   anchorId: string;
+  rects?: SelectionRect[];
+}
+
+interface SelectionRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  pageNumber?: number;
 }
 
 interface HeadingItem {
@@ -276,6 +287,7 @@ interface DomSelectionSnapshot {
   text: string;
   locationLabel?: string;
   pageNumber?: number;
+  rects?: SelectionRect[];
 }
 
 interface TextExtractorApi {
@@ -350,7 +362,9 @@ export default class CodexReadingPlugin extends Plugin {
   private lastMarkedText = "";
   private lastSelectionSnapshot: SelectionSnapshot | null = null;
   private lastReadingFilePath: string | null = null;
+  private lastBridgeSelectionKey = "";
   private highlightPopover: HTMLElement | null = null;
+  private transientHighlightLayer: HTMLElement | null = null;
   private immersiveExitButton: HTMLButtonElement | null = null;
   private readonly selectionFrameDocuments = new WeakSet<Document>();
   private readonly documentExtractionCache = new Map<string, DocumentExtractionCacheEntry>();
@@ -453,6 +467,7 @@ export default class CodexReadingPlugin extends Plugin {
       leaf.detach();
     }
     this.closeHighlightPopover();
+    this.clearTransientHighlightOverlay();
     this.disableImmersiveMode(false);
   }
 
@@ -607,6 +622,9 @@ export default class CodexReadingPlugin extends Plugin {
           endLine: editorSelection
             ? editor.getCursor("to").line + 1
             : (selectionSnapshot?.to?.line ?? editor.getCursor("to").line) + 1,
+          locationLabel: domSelection?.locationLabel ?? selectionSnapshot?.locationLabel,
+          pageNumber: domSelection?.pageNumber ?? selectionSnapshot?.pageNumber,
+          rects: domSelection?.rects ?? selectionSnapshot?.rects,
         }
       : undefined;
     const lines = content.split(/\r?\n/);
@@ -666,6 +684,7 @@ export default class CodexReadingPlugin extends Plugin {
           locationLabel,
           pageNumber,
           chapterTitle,
+          rects: domSelection?.rects ?? selectionSnapshot?.rects,
         }
       : undefined;
 
@@ -733,7 +752,9 @@ export default class CodexReadingPlugin extends Plugin {
 
   async markActiveSelection(context: ReadingContext): Promise<MarkedSelectionResult | null> {
     if (!context.selection?.text.trim()) return null;
-    if (context.sourceType !== "markdown") return null;
+    if (context.sourceType !== "markdown") {
+      return this.markExtractedDocumentSelection(context);
+    }
 
     const markdownView = this.getReadingMarkdownView(context.activeFilePath);
     const file = markdownView?.file;
@@ -759,6 +780,35 @@ export default class CodexReadingPlugin extends Plugin {
     }
 
     return this.markSelectionByTextSearch(file, context);
+  }
+
+  private async markExtractedDocumentSelection(context: ReadingContext): Promise<MarkedSelectionResult | null> {
+    const selection = context.selection;
+    const selectedText = selection?.text.trim();
+    if (!selection || !selectedText) return null;
+
+    const snapshot = this.getUsableSelectionSnapshot(context.activeFilePath);
+    const rects = selection.rects ?? snapshot?.rects;
+    const anchorId = createDocumentHighlightAnchorId(context.activeFilePath, selection);
+    const result: MarkedSelectionResult = {
+      filePath: context.activeFilePath,
+      text: selectedText,
+      startLine: selection.startLine,
+      endLine: selection.endLine,
+      anchorId,
+      rects,
+    };
+
+    if (rects?.length) {
+      this.renderTransientHighlightOverlay(anchorId, rects);
+    }
+
+    const file = this.app.vault.getAbstractFileByPath(context.activeFilePath);
+    if (file instanceof TFile) {
+      await this.writeCurrentSelectionBridgeFile(file, selection, anchorId);
+    }
+
+    return result;
   }
 
   async enrichReadingContext(
@@ -1542,8 +1592,92 @@ export default class CodexReadingPlugin extends Plugin {
       to: hasEditorSelection && editor ? cloneEditorPosition(editor.getCursor("to")) : undefined,
       locationLabel: domSelection.locationLabel,
       pageNumber: domSelection.pageNumber,
+      rects: domSelection.rects,
       capturedAt: Date.now(),
     };
+
+    const sourceType = getReadingSourceType(file);
+    const anchorId =
+      sourceType && sourceType !== "markdown"
+        ? createDocumentHighlightAnchorId(file.path, this.lastSelectionSnapshot)
+        : undefined;
+    if (anchorId && domSelection.rects?.length) {
+      this.renderTransientHighlightOverlay(anchorId, domSelection.rects);
+    }
+    void this.writeCurrentSelectionBridgeFile(file, this.lastSelectionSnapshot, anchorId);
+  }
+
+  private async writeCurrentSelectionBridgeFile(
+    file: TFile,
+    selection: Pick<ReadingSelection | SelectionSnapshot, "text" | "locationLabel" | "pageNumber">,
+    anchorId?: string,
+  ): Promise<void> {
+    const selectedText = selection.text.trim();
+    if (!selectedText) return;
+
+    const noteFolder = normalizePath(this.settings.noteFolder || DEFAULT_SETTINGS.noteFolder);
+    const targetPath = normalizePath(`${noteFolder}/当前阅读选区.md`);
+    const location = selection.locationLabel ?? (selection.pageNumber ? `第 ${selection.pageNumber} 页` : "当前位置");
+    const selectionKey = `${file.path}\n${location}\n${anchorId ?? ""}\n${selectedText}`;
+    if (selectionKey === this.lastBridgeSelectionKey) return;
+    this.lastBridgeSelectionKey = selectionKey;
+
+    await this.ensureFolder(noteFolder);
+    const highlightNoteLink = anchorId
+      ? formatWikiLink(`${noteFolder}/高亮批注/${anchorId}.md`, anchorId)
+      : "等待提问后生成";
+    const content = [
+      "# 当前阅读选区",
+      "",
+      `来源：${formatWikiLink(file.path, file.basename)}`,
+      `文件路径：${file.path}`,
+      `位置：${location}`,
+      `锚点：${highlightNoteLink}`,
+      `更新时间：${formatLocalDateTime(new Date())}`,
+      "",
+      "## 选中文本",
+      "",
+      blockquoteMarkdown(selectedText),
+    ].join("\n");
+
+    const existing = this.app.vault.getAbstractFileByPath(targetPath);
+    if (existing instanceof TFile) {
+      await this.app.vault.modify(existing, content);
+    } else {
+      await this.app.vault.create(targetPath, content);
+    }
+  }
+
+  private renderTransientHighlightOverlay(anchorId: string, rects: SelectionRect[]) {
+    const visibleRects = rects.filter((rect) => rect.width >= 2 && rect.height >= 2).slice(0, 40);
+    if (!visibleRects.length) return;
+
+    const layer = this.getTransientHighlightLayer();
+    layer.empty();
+
+    for (const rect of visibleRects) {
+      const marker = document.createElement("button");
+      marker.type = "button";
+      marker.className = "web-reading-overlay-highlight";
+      marker.dataset.webAnchor = anchorId;
+      marker.setAttribute("aria-label", `打开 ${PLUGIN_DISPLAY_NAME} 高亮批注`);
+      marker.style.left = `${rect.left}px`;
+      marker.style.top = `${rect.top}px`;
+      marker.style.width = `${rect.width}px`;
+      marker.style.height = `${rect.height}px`;
+      layer.appendChild(marker);
+    }
+  }
+
+  private getTransientHighlightLayer(): HTMLElement {
+    if (this.transientHighlightLayer?.isConnected) return this.transientHighlightLayer;
+    this.transientHighlightLayer = document.body.createDiv({ cls: "web-reading-overlay-layer" });
+    return this.transientHighlightLayer;
+  }
+
+  private clearTransientHighlightOverlay() {
+    this.transientHighlightLayer?.remove();
+    this.transientHighlightLayer = null;
   }
 
   private getUsableSelectionSnapshot(filePath: string): SelectionSnapshot | null {
@@ -1658,7 +1792,9 @@ export default class CodexReadingPlugin extends Plugin {
 
   private async handleHighlightNoteClick(event: MouseEvent) {
     const target = event.target instanceof Element ? event.target : null;
-    const marker = target?.closest<HTMLElement>(".web-highlight-note[data-web-anchor]");
+    const marker = target?.closest<HTMLElement>(
+      ".web-highlight-note[data-web-anchor], .web-reading-overlay-highlight[data-web-anchor]",
+    );
     if (!marker) return;
 
     event.preventDefault();
@@ -4165,21 +4301,48 @@ function createHighlightAnchorId(): string {
   return `web-hl-${stamp}-${suffix}`;
 }
 
+function createDocumentHighlightAnchorId(
+  filePath: string,
+  selection: Pick<ReadingSelection | SelectionSnapshot, "text" | "locationLabel" | "pageNumber">,
+): string {
+  const normalizedText = normalizeLooseText(selection.text).slice(0, 1000);
+  const key = [filePath, selection.pageNumber ?? "", selection.locationLabel ?? "", normalizedText].join("\n");
+  return `web-doc-hl-${hashString(key)}`;
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function formatHighlightAnchorMarkup(anchorId: string): string {
   return `<span class="web-highlight-note" data-web-anchor="${anchorId}" title="展开 ${PLUGIN_DISPLAY_NAME} 讨论">✎</span>`;
 }
 
 function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
-  const windows: Window[] = [window];
+  const windows: Array<{ targetWindow: Window; offsetLeft: number; offsetTop: number }> = [
+    { targetWindow: window, offsetLeft: 0, offsetTop: 0 },
+  ];
   for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
     try {
-      if (iframe.contentWindow) windows.push(iframe.contentWindow);
+      if (iframe.contentWindow) {
+        const iframeRect = iframe.getBoundingClientRect();
+        windows.push({
+          targetWindow: iframe.contentWindow,
+          offsetLeft: iframeRect.left,
+          offsetTop: iframeRect.top,
+        });
+      }
     } catch {
       // 跨域 iframe 不能读取选区，直接跳过。
     }
   }
 
-  for (const targetWindow of windows) {
+  for (const { targetWindow, offsetLeft, offsetTop } of windows) {
     let selection: Selection | null | undefined;
     try {
       selection = targetWindow.getSelection?.();
@@ -4194,14 +4357,42 @@ function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
     if (anchorElement?.closest(".codex-reading-root")) continue;
     const pageElement = anchorElement?.closest<HTMLElement>("[data-page-number]");
     const pageNumber = parseOptionalPositiveInteger(pageElement?.dataset.pageNumber);
+    const rects = getSelectionRects(selection, offsetLeft, offsetTop, pageNumber);
     return {
       text: selectedText,
       pageNumber,
       locationLabel: pageNumber ? `第 ${pageNumber} 页` : undefined,
+      rects,
     };
   }
 
   return null;
+}
+
+function getSelectionRects(
+  selection: Selection | null | undefined,
+  offsetLeft: number,
+  offsetTop: number,
+  pageNumber?: number,
+): SelectionRect[] {
+  if (!selection?.rangeCount) return [];
+
+  const rects: SelectionRect[] = [];
+  for (let rangeIndex = 0; rangeIndex < selection.rangeCount; rangeIndex += 1) {
+    const range = selection.getRangeAt(rangeIndex);
+    for (const rect of Array.from(range.getClientRects())) {
+      if (rect.width < 2 || rect.height < 2) continue;
+      rects.push({
+        left: rect.left + offsetLeft,
+        top: rect.top + offsetTop,
+        width: rect.width,
+        height: rect.height,
+        pageNumber,
+      });
+    }
+  }
+
+  return rects.slice(0, 80);
 }
 
 function getSelectionAnchorElement(selection: Selection | null): Element | null {
@@ -4397,7 +4588,11 @@ function getLineNumberAtOffset(content: string, offset: number): number {
 }
 
 function isSameLooseText(left: string, right: string): boolean {
-  return left.replace(/\s+/g, " ").trim() === right.replace(/\s+/g, " ").trim();
+  return normalizeLooseText(left) === normalizeLooseText(right);
+}
+
+function normalizeLooseText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function looksLikePath(command: string): boolean {
