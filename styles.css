@@ -687,6 +687,36 @@ body.think-anytime-immersive .workspace-tabs.mod-root {
   padding: 10px 14px 12px;
 }
 
+.web-highlight-popover-section {
+  border-bottom: 1px solid color-mix(in srgb, var(--background-modifier-border), transparent 44%);
+  padding: 10px 0 12px;
+}
+
+.web-highlight-popover-section:first-child {
+  padding-top: 0;
+}
+
+.web-highlight-popover-section:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.web-highlight-popover-section-title {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0;
+  margin-bottom: 6px;
+}
+
+.web-highlight-popover-section-content > :first-child {
+  margin-top: 0;
+}
+
+.web-highlight-popover-section-content > :last-child {
+  margin-bottom: 0;
+}
+
 .web-highlight-popover-body h1 {
   display: none;
 }

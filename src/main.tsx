@@ -31,6 +31,8 @@ const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const CODEX_MODEL_OPTIONS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] as const;
 const MAX_STORED_CONVERSATIONS = 18;
 const MAX_STORED_MESSAGES = 24;
+const MAX_STORED_HIGHLIGHT_ANCHORS = 240;
+const MAX_STORED_HIGHLIGHT_CONVERSATIONS = 36;
 const IMMERSIVE_BODY_CLASS = "think-anytime-immersive";
 const IMMERSIVE_EXIT_BUTTON_CLASS = "think-anytime-immersive-exit";
 const THINK_ANYTIME_ICON_SVG = `
@@ -235,8 +237,33 @@ interface StoredReadingConversation {
   messages: StoredReadingMessage[];
 }
 
+interface StoredHighlightConversationItem {
+  id: string;
+  timestamp: number;
+  question: string;
+  summary: string;
+  answerPreview: string;
+  notePath: string;
+  questionNodePath: string;
+  readingTrailPaths: string[];
+}
+
+interface StoredHighlightAnchor {
+  anchorId: string;
+  filePath: string;
+  fileName: string;
+  sourceType: ReadingSourceType;
+  text: string;
+  locationLabel?: string;
+  pageNumber?: number;
+  createdAt: number;
+  updatedAt: number;
+  conversations: StoredHighlightConversationItem[];
+}
+
 interface PluginStoredData extends Partial<CodexReadingSettings> {
   conversationHistory?: unknown;
+  highlightAnchors?: unknown;
 }
 
 interface ChatMessage {
@@ -359,6 +386,7 @@ const DEFAULT_SETTINGS: CodexReadingSettings = {
 export default class CodexReadingPlugin extends Plugin {
   settings: CodexReadingSettings = DEFAULT_SETTINGS;
   private conversationHistory: StoredReadingConversation[] = [];
+  private highlightAnchors: StoredHighlightAnchor[] = [];
   private lastMarkedText = "";
   private lastSelectionSnapshot: SelectionSnapshot | null = null;
   private lastReadingFilePath: string | null = null;
@@ -540,6 +568,7 @@ export default class CodexReadingPlugin extends Plugin {
       this.settings.defaultReasoningPreset,
     );
     this.conversationHistory = normalizeStoredReadingConversations(data.conversationHistory);
+    this.highlightAnchors = normalizeStoredHighlightAnchors(data.highlightAnchors);
   }
 
   async saveSettings() {
@@ -567,6 +596,7 @@ export default class CodexReadingPlugin extends Plugin {
     await this.saveData({
       ...this.settings,
       conversationHistory: this.conversationHistory,
+      highlightAnchors: this.highlightAnchors,
     });
   }
 
@@ -1747,9 +1777,22 @@ export default class CodexReadingPlugin extends Plugin {
     const trailLinks = record.readingTrailPaths.length
       ? record.readingTrailPaths.map((path) => formatWikiLink(path)).join("、")
       : "无";
+    const timestamp = Date.now();
+    const summary = buildHighlightConversationSummary(question, result);
+    const answerPreview = trimToLimit(extractAnswerPreview(result), 220);
+    const storedAnchor = this.upsertHighlightAnchorRecord(anchor, context, {
+      id: createMessageId(),
+      timestamp,
+      question: question.trim(),
+      summary,
+      answerPreview,
+      notePath: readingNotePath,
+      questionNodePath: record.questionNodePath,
+      readingTrailPaths: record.readingTrailPaths,
+    });
     const entry = [
       "",
-      `## ${formatLocalDateTime(new Date())}`,
+      `### ${formatLocalDateTime(new Date(timestamp))}`,
       "",
       `- 来源：${sourceLink}，${formatMarkedSelectionLocation(anchor, context)}`,
       `- 问题节点：${questionNodeLink}`,
@@ -1771,23 +1814,50 @@ export default class CodexReadingPlugin extends Plugin {
     ].join("\n");
 
     const existing = this.app.vault.getAbstractFileByPath(targetPath);
+    const existingDetails =
+      existing instanceof TFile ? extractHighlightDetailSection(await this.app.vault.read(existing)) : "";
+    const nextContent = buildHighlightNoteMarkdown(
+      anchor,
+      context,
+      storedAnchor,
+      `${existingDetails.trimEnd()}\n${entry}`.trim(),
+    );
     if (existing instanceof TFile) {
-      const current = await this.app.vault.read(existing);
-      await this.app.vault.modify(existing, `${current.trimEnd()}\n${entry}`);
+      await this.app.vault.modify(existing, nextContent);
     } else {
-      const header = [
-        `# 高亮批注 ${anchor.anchorId}`,
-        "",
-        `来源：${sourceLink}`,
-        `位置：${formatMarkedSelectionLocation(anchor, context)}`,
-        "",
-        `这个文件由 ${PLUGIN_DISPLAY_NAME} 自动维护，用来保存同一处高亮上的连续问题和讨论。`,
-        "",
-      ].join("\n");
-      await this.app.vault.create(targetPath, `${header}${entry}`);
+      await this.app.vault.create(targetPath, nextContent);
     }
+    await this.savePluginData();
 
     return targetPath;
+  }
+
+  private upsertHighlightAnchorRecord(
+    anchor: MarkedSelectionResult,
+    context: ReadingContext,
+    conversation: StoredHighlightConversationItem,
+  ): StoredHighlightAnchor {
+    const existing = this.highlightAnchors.find((item) => item.anchorId === anchor.anchorId);
+    const now = Date.now();
+    const next: StoredHighlightAnchor = {
+      anchorId: anchor.anchorId,
+      filePath: context.activeFilePath,
+      fileName: context.activeFileName,
+      sourceType: context.sourceType,
+      text: anchor.text,
+      locationLabel: formatMarkedSelectionLocation(anchor, context),
+      pageNumber: context.selection?.pageNumber,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      conversations: [...(existing?.conversations ?? []), conversation].slice(
+        -MAX_STORED_HIGHLIGHT_CONVERSATIONS,
+      ),
+    };
+
+    this.highlightAnchors = [next, ...this.highlightAnchors.filter((item) => item.anchorId !== anchor.anchorId)]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, MAX_STORED_HIGHLIGHT_ANCHORS);
+    return next;
   }
 
   private async handleHighlightNoteClick(event: MouseEvent) {
@@ -1828,7 +1898,7 @@ export default class CodexReadingPlugin extends Plugin {
     const file = this.app.vault.getAbstractFileByPath(notePath);
     if (file instanceof TFile) {
       const markdown = await this.app.vault.read(file);
-      await MarkdownRenderer.render(this.app, markdown, body, notePath, this);
+      await this.renderHighlightPopoverSections(markdown, body, notePath);
     } else {
       body.createDiv({
         cls: "web-highlight-popover-empty",
@@ -1847,6 +1917,32 @@ export default class CodexReadingPlugin extends Plugin {
     });
 
     this.highlightPopover = popover;
+  }
+
+  private async renderHighlightPopoverSections(markdown: string, body: HTMLElement, notePath: string) {
+    const sections = [
+      { title: "对话总结", content: extractMarkdownSection(markdown, "对话总结") },
+      { title: "历史对话记录", content: extractMarkdownSection(markdown, "历史对话记录") },
+      { title: "详细内容", content: extractMarkdownSection(markdown, "详细内容") },
+    ];
+
+    if (sections.every((section) => !section.content.trim())) {
+      await MarkdownRenderer.render(this.app, markdown, body, notePath, this);
+      return;
+    }
+
+    for (const section of sections) {
+      const sectionEl = body.createDiv({ cls: "web-highlight-popover-section" });
+      sectionEl.createDiv({ cls: "web-highlight-popover-section-title", text: section.title });
+      const contentEl = sectionEl.createDiv({ cls: "web-highlight-popover-section-content" });
+      await MarkdownRenderer.render(
+        this.app,
+        section.content.trim() || "暂无内容。",
+        contentEl,
+        notePath,
+        this,
+      );
+    }
   }
 
   private closeHighlightPopover() {
@@ -2798,6 +2894,73 @@ function normalizeStoredReadingMessages(value: unknown): StoredReadingMessage[] 
     .slice(-MAX_STORED_MESSAGES);
 }
 
+function normalizeStoredHighlightAnchors(value: unknown): StoredHighlightAnchor[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): StoredHighlightAnchor | null => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const anchorId = firstString(record, ["anchorId", "anchor_id"]);
+      const filePath = firstString(record, ["filePath", "sourcePath"]);
+      const fileName = firstString(record, ["fileName", "sourceName"]) || filePath.split("/").at(-1) || filePath;
+      const text = firstString(record, ["text"]);
+      if (!anchorId || !filePath || !text) return null;
+      const sourceType = normalizeReadingSourceType(record.sourceType);
+      if (!sourceType) return null;
+      const createdAt = Number(record.createdAt);
+      const updatedAt = Number(record.updatedAt);
+      const pageNumber = Number(record.pageNumber);
+      return {
+        anchorId,
+        filePath,
+        fileName,
+        sourceType,
+        text,
+        locationLabel: firstString(record, ["locationLabel"]),
+        pageNumber: Number.isFinite(pageNumber) && pageNumber > 0 ? pageNumber : undefined,
+        createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
+        updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
+        conversations: normalizeStoredHighlightConversations(record.conversations),
+      };
+    })
+    .filter((item): item is StoredHighlightAnchor => item !== null)
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, MAX_STORED_HIGHLIGHT_ANCHORS);
+}
+
+function normalizeStoredHighlightConversations(value: unknown): StoredHighlightConversationItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item): StoredHighlightConversationItem | null => {
+      const record = asRecord(item);
+      if (!record) return null;
+      const id = firstString(record, ["id"]) || createMessageId();
+      const question = firstString(record, ["question"]);
+      if (!question.trim()) return null;
+      const timestamp = Number(record.timestamp);
+      const readingTrailPaths = Array.isArray(record.readingTrailPaths)
+        ? record.readingTrailPaths.filter((path): path is string => typeof path === "string")
+        : [];
+      return {
+        id,
+        timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+        question,
+        summary: firstString(record, ["summary"]) || "暂无总结",
+        answerPreview: firstString(record, ["answerPreview"]),
+        notePath: firstString(record, ["notePath"]),
+        questionNodePath: firstString(record, ["questionNodePath"]),
+        readingTrailPaths,
+      };
+    })
+    .filter((item): item is StoredHighlightConversationItem => item !== null)
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-MAX_STORED_HIGHLIGHT_CONVERSATIONS);
+}
+
+function normalizeReadingSourceType(value: unknown): ReadingSourceType | null {
+  return value === "markdown" || value === "pdf" || value === "epub" ? value : null;
+}
+
 function upsertStoredReadingConversation(
   conversations: StoredReadingConversation[],
   conversation: StoredReadingConversation,
@@ -3480,6 +3643,91 @@ function formatContextLocation(context: ReadingContext): string {
 function formatMarkedSelectionLocation(anchor: MarkedSelectionResult, context: ReadingContext): string {
   if (context.selection?.locationLabel) return context.selection.locationLabel;
   return `第 ${anchor.startLine}-${anchor.endLine} 行`;
+}
+
+function buildHighlightNoteMarkdown(
+  anchor: MarkedSelectionResult,
+  context: ReadingContext,
+  storedAnchor: StoredHighlightAnchor,
+  detailMarkdown: string,
+): string {
+  const sourceLink = formatWikiLink(context.activeFilePath, context.activeFileName);
+  const summaryLines = storedAnchor.conversations.map((conversation) => {
+    return `- ${formatLocalDateTime(new Date(conversation.timestamp))}：${conversation.summary}`;
+  });
+  const historyLines = storedAnchor.conversations.map((conversation) => {
+    const noteLink = conversation.notePath ? formatWikiLink(conversation.notePath, "阅读笔记") : "无";
+    const questionNodeLink = conversation.questionNodePath
+      ? formatWikiLink(conversation.questionNodePath, "问题节点")
+      : "无";
+    return [
+      `- ${formatLocalDateTime(new Date(conversation.timestamp))}`,
+      `  - 问题：${conversation.question}`,
+      `  - 预览：${conversation.answerPreview || "暂无"}`,
+      `  - 链接：${noteLink}；${questionNodeLink}`,
+    ].join("\n");
+  });
+
+  return [
+    `# 高亮批注 ${anchor.anchorId}`,
+    "",
+    `来源：${sourceLink}`,
+    `位置：${storedAnchor.locationLabel ?? formatMarkedSelectionLocation(anchor, context)}`,
+    `锚点：${anchor.anchorId}`,
+    "",
+    `这个文件由 ${PLUGIN_DISPLAY_NAME} 自动维护，用来保存同一处高亮上的连续问题和讨论。`,
+    "",
+    "## 高亮原文",
+    "",
+    blockquoteMarkdown(anchor.text),
+    "",
+    "## 对话总结",
+    "",
+    summaryLines.length ? summaryLines.join("\n") : "暂无总结。",
+    "",
+    "## 历史对话记录",
+    "",
+    historyLines.length ? historyLines.join("\n") : "暂无历史对话。",
+    "",
+    "## 详细内容",
+    "",
+    detailMarkdown.trim() || "暂无详细内容。",
+    "",
+  ].join("\n");
+}
+
+function buildHighlightConversationSummary(question: string, result: CodexRunResult): string {
+  const structured = result.structuredResponse;
+  const seed = structured?.answer || structured?.currentMaterial || result.answer;
+  const answer = trimToLimit(seed.replace(/\s+/g, " "), 160);
+  return `围绕“${trimToLimit(question.replace(/\s+/g, " "), 48)}”，结论是：${answer}`;
+}
+
+function extractAnswerPreview(result: CodexRunResult): string {
+  const structured = result.structuredResponse;
+  return structured?.answer || structured?.currentMaterial || result.answer;
+}
+
+function extractHighlightDetailSection(markdown: string): string {
+  const detail = extractMarkdownSection(markdown, "详细内容");
+  if (detail.trim()) return detail.trim();
+  const firstEntryIndex = markdown.search(/^##\s+\d{4}\/\d{2}\/\d{2}/m);
+  if (firstEntryIndex >= 0) return markdown.slice(firstEntryIndex).trim();
+  return "";
+}
+
+function extractMarkdownSection(markdown: string, title: string): string {
+  const headingPattern = new RegExp(`^##\\s+${escapeRegExp(title)}\\s*$`, "m");
+  const match = headingPattern.exec(markdown);
+  if (!match) return "";
+  const start = match.index + match[0].length;
+  const rest = markdown.slice(start);
+  const nextHeading = rest.search(/^##\s+/m);
+  return (nextHeading >= 0 ? rest.slice(0, nextHeading) : rest).trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function blockquoteMarkdown(value: string): string {
