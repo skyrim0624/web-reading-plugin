@@ -120,6 +120,7 @@ interface SelectionRect {
   width: number;
   height: number;
   pageNumber?: number;
+  containerId?: string;
 }
 
 interface HeadingItem {
@@ -398,7 +399,8 @@ export default class CodexReadingPlugin extends Plugin {
   private lastReadingFilePath: string | null = null;
   private lastBridgeSelectionKey = "";
   private highlightPopover: HTMLElement | null = null;
-  private transientHighlightLayer: HTMLElement | null = null;
+  private transientHighlightLayers: HTMLElement[] = [];
+  private transientHighlightHosts: HTMLElement[] = [];
   private immersiveExitButton: HTMLButtonElement | null = null;
   private readonly selectionFrameDocuments = new WeakSet<Document>();
   private readonly documentExtractionCache = new Map<string, DocumentExtractionCacheEntry>();
@@ -1748,36 +1750,70 @@ export default class CodexReadingPlugin extends Plugin {
   }
 
   private renderTransientHighlightOverlay(anchorId: string, rects: SelectionRect[]) {
-    const visibleRects = rects.filter((rect) => rect.width >= 2 && rect.height >= 2).slice(0, 40);
+    const visibleRects = mergeSelectionRects(
+      rects.filter((rect) => rect.width >= 2 && rect.height >= 2),
+    ).slice(0, 80);
     if (!visibleRects.length) return;
 
-    const layer = this.getTransientHighlightLayer();
-    layer.empty();
+    this.clearTransientHighlightOverlay();
 
-    for (const rect of visibleRects) {
-      const marker = document.createElement("span");
-      marker.className = "web-reading-overlay-highlight";
-      marker.dataset.webAnchor = anchorId;
-      marker.tabIndex = 0;
-      marker.setAttribute("role", "button");
-      marker.setAttribute("aria-label", `打开 ${PLUGIN_DISPLAY_NAME} 高亮批注`);
-      marker.style.left = `${rect.left}px`;
-      marker.style.top = `${rect.top}px`;
-      marker.style.width = `${rect.width}px`;
-      marker.style.height = `${rect.height}px`;
-      layer.appendChild(marker);
+    for (const [containerId, groupRects] of groupSelectionRectsByContainer(visibleRects)) {
+      const host = findOverlayHostById(containerId) ?? document.body;
+      const layer = this.createTransientHighlightLayer(host);
+      for (const rect of groupRects) {
+        const marker = host.ownerDocument.createElement("span");
+        marker.className = "web-reading-overlay-highlight";
+        marker.dataset.webAnchor = anchorId;
+        marker.tabIndex = 0;
+        marker.setAttribute("role", "button");
+        marker.setAttribute("aria-label", `打开 ${PLUGIN_DISPLAY_NAME} 高亮批注`);
+        marker.style.left = `${rect.left}px`;
+        marker.style.top = `${rect.top}px`;
+        marker.style.width = `${rect.width}px`;
+        marker.style.height = `${rect.height}px`;
+        applyOverlayMarkerInlineStyles(marker);
+        layer.appendChild(marker);
+      }
     }
   }
 
-  private getTransientHighlightLayer(): HTMLElement {
-    if (this.transientHighlightLayer?.isConnected) return this.transientHighlightLayer;
-    this.transientHighlightLayer = document.body.createDiv({ cls: "web-reading-overlay-layer" });
-    return this.transientHighlightLayer;
+  private createTransientHighlightLayer(host: HTMLElement): HTMLElement {
+    this.prepareTransientHighlightHost(host);
+    const layer = host.ownerDocument.createElement("div");
+    layer.className = "web-reading-overlay-layer";
+    applyOverlayLayerInlineStyles(layer);
+    host.appendChild(layer);
+    this.transientHighlightLayers.push(layer);
+    return layer;
+  }
+
+  private prepareTransientHighlightHost(host: HTMLElement) {
+    if (!this.transientHighlightHosts.includes(host)) {
+      this.transientHighlightHosts.push(host);
+    }
+    host.classList.add("web-reading-overlay-host");
+
+    const position = host.ownerDocument.defaultView?.getComputedStyle(host).position;
+    if (position === "static" && !host.dataset.webReadingOverlayPreviousPosition) {
+      host.dataset.webReadingOverlayPreviousPosition = host.style.position;
+      host.style.position = "relative";
+    }
   }
 
   private clearTransientHighlightOverlay() {
-    this.transientHighlightLayer?.remove();
-    this.transientHighlightLayer = null;
+    for (const layer of this.transientHighlightLayers) {
+      layer.remove();
+    }
+    this.transientHighlightLayers = [];
+
+    for (const host of this.transientHighlightHosts) {
+      host.classList.remove("web-reading-overlay-host");
+      if (host.dataset.webReadingOverlayPreviousPosition !== undefined) {
+        host.style.position = host.dataset.webReadingOverlayPreviousPosition;
+        delete host.dataset.webReadingOverlayPreviousPosition;
+      }
+    }
+    this.transientHighlightHosts = [];
   }
 
   private getUsableSelectionSnapshot(filePath: string): SelectionSnapshot | null {
@@ -4721,25 +4757,16 @@ function formatHighlightAnchorMarkup(anchorId: string): string {
 }
 
 function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
-  const windows: Array<{ targetWindow: Window; offsetLeft: number; offsetTop: number }> = [
-    { targetWindow: window, offsetLeft: 0, offsetTop: 0 },
-  ];
+  const windows: Window[] = [window];
   for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
     try {
-      if (iframe.contentWindow) {
-        const iframeRect = iframe.getBoundingClientRect();
-        windows.push({
-          targetWindow: iframe.contentWindow,
-          offsetLeft: iframeRect.left,
-          offsetTop: iframeRect.top,
-        });
-      }
+      if (iframe.contentWindow) windows.push(iframe.contentWindow);
     } catch {
       // 跨域 iframe 不能读取选区，直接跳过。
     }
   }
 
-  for (const { targetWindow, offsetLeft, offsetTop } of windows) {
+  for (const targetWindow of windows) {
     let selection: Selection | null | undefined;
     try {
       selection = targetWindow.getSelection?.();
@@ -4754,7 +4781,8 @@ function getCurrentDomSelectionSnapshot(): DomSelectionSnapshot | null {
     if (anchorElement?.closest(".codex-reading-root")) continue;
     const pageElement = anchorElement?.closest<HTMLElement>("[data-page-number]") ?? null;
     const pageNumber = parseOptionalPositiveInteger(pageElement?.dataset.pageNumber);
-    const rects = getSelectionRects(selection, offsetLeft, offsetTop, pageNumber);
+    const rectHost = getSelectionRectHost(anchorElement, pageElement, targetWindow.document);
+    const rects = getSelectionRects(selection, rectHost, pageNumber);
     const contextText = getSelectionContextText(targetWindow.document, anchorElement, pageElement, selectedText);
     return {
       text: selectedText,
@@ -4822,30 +4850,233 @@ function normalizeDomReadingText(value: string): string {
     .trim();
 }
 
+interface SelectionRectHost {
+  element: HTMLElement;
+  containerId: string;
+}
+
+let nextOverlayHostId = 1;
+
+function getSelectionRectHost(
+  anchorElement: Element | null,
+  pageElement: HTMLElement | null,
+  ownerDocument: Document,
+): SelectionRectHost {
+  const fallbackElement = getDocumentScrollElement(ownerDocument);
+  const element =
+    pageElement ??
+    findClosestScrollableElement(anchorElement) ??
+    fallbackElement;
+
+  return {
+    element,
+    containerId: ensureOverlayHostId(element),
+  };
+}
+
+function getDocumentScrollElement(ownerDocument: Document): HTMLElement {
+  const scrollingElement = ownerDocument.scrollingElement;
+  if (scrollingElement instanceof HTMLElement) return scrollingElement;
+  return ownerDocument.body;
+}
+
+function findClosestScrollableElement(element: Element | null): HTMLElement | null {
+  const ownerWindow = element?.ownerDocument.defaultView;
+  let current = element instanceof HTMLElement ? element : element?.parentElement ?? null;
+
+  while (current && current !== current.ownerDocument.body) {
+    const style = ownerWindow?.getComputedStyle(current);
+    const overflow = `${style?.overflowX ?? ""} ${style?.overflowY ?? ""}`;
+    const canScroll = /(auto|scroll|overlay)/.test(overflow);
+    const hasScrollableContent =
+      current.scrollHeight > current.clientHeight + 2 ||
+      current.scrollWidth > current.clientWidth + 2;
+    if (canScroll && hasScrollableContent) return current;
+    current = current.parentElement;
+  }
+
+  return null;
+}
+
+function ensureOverlayHostId(element: HTMLElement): string {
+  const existing = element.dataset.webReadingOverlayHost;
+  if (existing) return existing;
+
+  const id = `web-reading-host-${Date.now().toString(36)}-${nextOverlayHostId}`;
+  nextOverlayHostId += 1;
+  element.dataset.webReadingOverlayHost = id;
+  return id;
+}
+
+function getElementScrollLeft(element: HTMLElement): number {
+  const ownerDocument = element.ownerDocument;
+  if (element === ownerDocument.body || element === ownerDocument.documentElement) {
+    return ownerDocument.defaultView?.scrollX ?? element.scrollLeft;
+  }
+  return element.scrollLeft;
+}
+
+function getElementScrollTop(element: HTMLElement): number {
+  const ownerDocument = element.ownerDocument;
+  if (element === ownerDocument.body || element === ownerDocument.documentElement) {
+    return ownerDocument.defaultView?.scrollY ?? element.scrollTop;
+  }
+  return element.scrollTop;
+}
+
 function getSelectionRects(
   selection: Selection | null | undefined,
-  offsetLeft: number,
-  offsetTop: number,
+  host: SelectionRectHost,
   pageNumber?: number,
 ): SelectionRect[] {
   if (!selection?.rangeCount) return [];
 
   const rects: SelectionRect[] = [];
+  const hostRect = host.element.getBoundingClientRect();
+  const hostScrollLeft = getElementScrollLeft(host.element);
+  const hostScrollTop = getElementScrollTop(host.element);
+
   for (let rangeIndex = 0; rangeIndex < selection.rangeCount; rangeIndex += 1) {
     const range = selection.getRangeAt(rangeIndex);
     for (const rect of Array.from(range.getClientRects())) {
       if (rect.width < 2 || rect.height < 2) continue;
       rects.push({
-        left: rect.left + offsetLeft,
-        top: rect.top + offsetTop,
+        left: rect.left - hostRect.left + hostScrollLeft,
+        top: rect.top - hostRect.top + hostScrollTop,
         width: rect.width,
         height: rect.height,
         pageNumber,
+        containerId: host.containerId,
       });
     }
   }
 
-  return rects.slice(0, 80);
+  return mergeSelectionRects(rects).slice(0, 80);
+}
+
+function mergeSelectionRects(rects: SelectionRect[]): SelectionRect[] {
+  const sortedRects = rects
+    .slice()
+    .sort((left, right) => {
+      const containerCompare = (left.containerId ?? "").localeCompare(right.containerId ?? "");
+      if (containerCompare !== 0) return containerCompare;
+      const pageCompare = (left.pageNumber ?? 0) - (right.pageNumber ?? 0);
+      if (pageCompare !== 0) return pageCompare;
+      if (Math.abs(left.top - right.top) > 2) return left.top - right.top;
+      return left.left - right.left;
+    });
+
+  const merged: SelectionRect[] = [];
+  for (const rect of sortedRects) {
+    const line = merged.find((candidate) => shouldMergeSelectionRects(candidate, rect));
+    if (!line) {
+      merged.push({ ...rect });
+      continue;
+    }
+
+    const left = Math.min(line.left, rect.left);
+    const top = Math.min(line.top, rect.top);
+    const right = Math.max(line.left + line.width, rect.left + rect.width);
+    const bottom = Math.max(line.top + line.height, rect.top + rect.height);
+    line.left = left;
+    line.top = top;
+    line.width = right - left;
+    line.height = bottom - top;
+  }
+
+  return merged.sort((left, right) => {
+    const containerCompare = (left.containerId ?? "").localeCompare(right.containerId ?? "");
+    if (containerCompare !== 0) return containerCompare;
+    const pageCompare = (left.pageNumber ?? 0) - (right.pageNumber ?? 0);
+    if (pageCompare !== 0) return pageCompare;
+    if (Math.abs(left.top - right.top) > 2) return left.top - right.top;
+    return left.left - right.left;
+  });
+}
+
+function shouldMergeSelectionRects(left: SelectionRect, right: SelectionRect): boolean {
+  if ((left.containerId ?? "") !== (right.containerId ?? "")) return false;
+  if ((left.pageNumber ?? 0) !== (right.pageNumber ?? 0)) return false;
+
+  const overlapTop = Math.max(left.top, right.top);
+  const overlapBottom = Math.min(left.top + left.height, right.top + right.height);
+  const verticalOverlap = Math.max(0, overlapBottom - overlapTop);
+  const smallerHeight = Math.max(1, Math.min(left.height, right.height));
+  const centerDelta = Math.abs(left.top + left.height / 2 - (right.top + right.height / 2));
+  const sameLine = verticalOverlap >= smallerHeight * 0.45 || centerDelta <= Math.max(3, smallerHeight * 0.35);
+  if (!sameLine) return false;
+
+  const leftRight = left.left + left.width;
+  const rightRight = right.left + right.width;
+  const horizontalGap =
+    right.left > leftRight
+      ? right.left - leftRight
+      : left.left > rightRight
+        ? left.left - rightRight
+        : 0;
+  return horizontalGap <= Math.max(24, Math.max(left.height, right.height) * 2.5);
+}
+
+function groupSelectionRectsByContainer(rects: SelectionRect[]): Array<[string | undefined, SelectionRect[]]> {
+  const groups = new Map<string, SelectionRect[]>();
+  for (const rect of rects) {
+    const key = rect.containerId ?? "";
+    const group = groups.get(key);
+    if (group) {
+      group.push(rect);
+    } else {
+      groups.set(key, [rect]);
+    }
+  }
+  return Array.from(groups.entries()).map(([key, group]) => [key || undefined, group]);
+}
+
+function findOverlayHostById(containerId: string | undefined): HTMLElement | null {
+  if (!containerId) return document.body;
+
+  for (const ownerDocument of getAccessibleDocuments()) {
+    const hosts = Array.from(ownerDocument.querySelectorAll<HTMLElement>("[data-web-reading-overlay-host]"));
+    const host = hosts.find((element) => element.dataset.webReadingOverlayHost === containerId);
+    if (host) return host;
+  }
+
+  return null;
+}
+
+function getAccessibleDocuments(): Document[] {
+  const documents = [document];
+  for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
+    try {
+      if (iframe.contentDocument) documents.push(iframe.contentDocument);
+    } catch {
+      // 跨域 iframe 不能读取选区，直接跳过。
+    }
+  }
+  return documents;
+}
+
+function applyOverlayLayerInlineStyles(layer: HTMLElement) {
+  layer.style.height = "0";
+  layer.style.left = "0";
+  layer.style.pointerEvents = "none";
+  layer.style.position = "absolute";
+  layer.style.top = "0";
+  layer.style.width = "0";
+  layer.style.zIndex = "9990";
+}
+
+function applyOverlayMarkerInlineStyles(marker: HTMLElement) {
+  marker.style.background = "rgba(255, 216, 77, 0.52)";
+  marker.style.border = "0";
+  marker.style.borderRadius = "3px";
+  marker.style.boxShadow = "0 0 0 1px rgba(201, 151, 0, 0.48)";
+  marker.style.boxSizing = "border-box";
+  marker.style.cursor = "pointer";
+  marker.style.display = "block";
+  marker.style.margin = "0";
+  marker.style.padding = "0";
+  marker.style.pointerEvents = "auto";
+  marker.style.position = "absolute";
 }
 
 function clearDomSelections() {
