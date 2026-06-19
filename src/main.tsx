@@ -1672,6 +1672,9 @@ export default class CodexReadingPlugin extends Plugin {
       this.registerDomEvent(frameDocument, "keyup", () => {
         window.setTimeout(() => this.captureSelectionSnapshot(), 0);
       });
+      this.registerDomEvent(frameDocument, "click", (event) => {
+        void this.handleHighlightNoteClick(event);
+      });
     }
   }
 
@@ -1987,7 +1990,7 @@ export default class CodexReadingPlugin extends Plugin {
     const noteFolder = normalizePath(this.settings.noteFolder || DEFAULT_SETTINGS.noteFolder);
     const notePath = normalizePath(`${noteFolder}/高亮批注/${anchorId}.md`);
     const popover = document.body.createDiv({ cls: "web-highlight-popover" });
-    const markerRect = marker.getBoundingClientRect();
+    const markerRect = getElementTopWindowRect(marker);
     const maxLeft = Math.max(16, window.innerWidth - 390);
     popover.style.left = `${Math.min(markerRect.right + 10, maxLeft)}px`;
     popover.style.top = `${Math.max(16, Math.min(markerRect.top - 12, window.innerHeight - 460))}px`;
@@ -5040,6 +5043,34 @@ function findOverlayHostById(containerId: string | undefined): HTMLElement | nul
     if (host) return host;
   }
 
+  return null;
+}
+
+function getElementTopWindowRect(element: HTMLElement): Pick<DOMRect, "left" | "right" | "top" | "bottom"> {
+  const rect = element.getBoundingClientRect();
+  const ownerWindow = element.ownerDocument.defaultView;
+  if (!ownerWindow || ownerWindow === window) return rect;
+
+  const iframe = findFrameElementForWindow(ownerWindow);
+  if (!iframe) return rect;
+
+  const iframeRect = iframe.getBoundingClientRect();
+  return {
+    left: rect.left + iframeRect.left,
+    right: rect.right + iframeRect.left,
+    top: rect.top + iframeRect.top,
+    bottom: rect.bottom + iframeRect.top,
+  };
+}
+
+function findFrameElementForWindow(targetWindow: Window): HTMLIFrameElement | null {
+  for (const iframe of Array.from(document.querySelectorAll("iframe"))) {
+    try {
+      if (iframe.contentWindow === targetWindow) return iframe;
+    } catch {
+      // 跨域 iframe 不能读取，直接跳过。
+    }
+  }
   return null;
 }
 
