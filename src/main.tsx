@@ -2108,6 +2108,7 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   const [responseMode, setResponseMode] = useState<CodexResponseMode>("fast");
   const [forceVaultRetrieval, setForceVaultRetrieval] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [selectionPreviewOpen, setSelectionPreviewOpen] = useState(false);
   const [history, setHistory] = useState<StoredReadingConversation[]>(() =>
     plugin.getConversationHistory(),
   );
@@ -2158,6 +2159,10 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
   useEffect(() => {
     return () => abortControllerRef.current?.abort();
   }, []);
+
+  useEffect(() => {
+    setSelectionPreviewOpen(false);
+  }, [context?.selection?.text]);
 
   useEffect(() => {
     const storedMessages = messages
@@ -2476,14 +2481,22 @@ function CodexReadingPanel({ plugin }: { plugin: CodexReadingPlugin }) {
           <div className="codex-reading-context-line">打开 Markdown、PDF 或 EPUB 后即可提问</div>
         )}
         {context?.selection?.text ? (
-          <div className="codex-selection-preview">
-            <div className="codex-selection-preview-title">
+          <div className={`codex-selection-preview${selectionPreviewOpen ? " codex-selection-preview-open" : ""}`}>
+            <button
+              aria-expanded={selectionPreviewOpen}
+              className="codex-selection-preview-title"
+              onClick={() => setSelectionPreviewOpen((open) => !open)}
+              type="button"
+            >
               <span>{context.activeFileBasename}</span>
-              <span>已选文本（{context.selection.text.length} 字）</span>
-            </div>
-            <div className="codex-selection-preview-text">
-              {trimToLimit(context.selection.text.replace(/\s+/g, " "), 180)}
-            </div>
+              <span>{context.selection.text.length} 字</span>
+              <span>{selectionPreviewOpen ? "收起" : "展开"}</span>
+            </button>
+            {selectionPreviewOpen ? (
+              <div className="codex-selection-preview-text">
+                {trimToLimit(context.selection.text.replace(/\s+/g, " "), 360)}
+              </div>
+            ) : null}
           </div>
         ) : null}
         {historyOpen ? (
